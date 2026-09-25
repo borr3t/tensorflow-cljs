@@ -122,7 +122,7 @@ consumer's =deps.edn= only needs:
 {:deps {io.github.borr3t/tensorflow-cljs {:local/root "../tensorflow-cljs"}
         ;; or, once pushed, a git dep pinned to a sha:
         ;; io.github.borr3t/tensorflow-cljs {:git/url "https://github.com/borr3t/tensorflow-cljs"
-        ;;                                   :git/sha "REPLACE-WITH-SHA"}
+        ;;                                   :git/sha "53ad92b"}
         }}
 #+end_src
 
