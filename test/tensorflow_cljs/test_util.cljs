@@ -60,6 +60,12 @@
   [file content]
   (.writeFileSync fs file content))
 
+(defn write-float32-file!
+  "Writes a vector of numbers as little-endian float32 bytes (a fabricated
+   weights.bin)."
+  [file floats]
+  (.writeFileSync fs file (js/Buffer.from (.-buffer (js/Float32Array. (to-array floats))))))
+
 (defn read-file
   "Reads a file as a string."
   [file]

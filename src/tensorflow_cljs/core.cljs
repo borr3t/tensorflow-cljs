@@ -135,7 +135,14 @@
   [x]
   (instance? tf/CustomCallback x))
 
-(defn- base-callback? [x] (instance? (gobj/get tf "BaseCallback") x))
+(def ^:private base-callback-class
+  "tfjs-layers' BaseCallback class. The umbrella does not export it (only
+   CustomCallback and callbacks.earlyStopping), so it is reached through
+   CustomCallback's prototype chain; EarlyStopping extends Callback extends
+   BaseCallback, so one instanceof covers every callback object."
+  (-> tf/CustomCallback (gobj/get "prototype") js/Object.getPrototypeOf (gobj/get "constructor")))
+
+(defn- base-callback? [x] (instance? base-callback-class x))
 
 ;; ---------------------------------------------------------------------------
 ;; ClojureScript <-> JS value conversion (the DataValues boundary, §2.7)
@@ -1213,6 +1220,15 @@
 
 (defn optimizer-class-name "\"SGD\", \"Adam\" .. of an opaque optimizer." [o] (js-invoke o "getClassName"))
 
+(defn optimizer-dispose!
+  "Frees an optimizer's internal tensors; returns nil. Needed because SGD
+   keeps its learning rate and Momentum its momentum as plain (kept) scalars
+   that `dispose-variables!` does not see (probe-verified: sgd 1, momentum 2;
+   adam / adamax / rmsprop / adagrad / adadelta use variables). tfjs 4.22's
+   Momentum.dispose frees only one of its two scalars."
+  [o]
+  (guard #(js-invoke o "dispose")) nil)
+
 (defn minimize!
   "One optimizer step: `f` is a zero-argument fn returning a scalar loss
    tensor; every trainable variable it touched (or `var-list`) is updated.
@@ -1405,19 +1421,24 @@
    :on-batch-end (fn [batch logs]) :on-train-begin (fn [logs]) :on-train-end
    (fn [logs]) :on-epoch-begin .. :on-batch-begin .. :on-yield (fn [epoch
    batch logs])}; `logs` arrives as a kebab map of numbers; a hook may return
-   a promise (awaited)."
-  [hooks]
-  (let [o (js-obj)]
-    (doseq [[k f] hooks]
-      (let [[js-name arity] (get callback-hooks k)]
-        (when-not js-name
-          (throw (util/argument-error (str "unknown callback hook " (pr-str k)) {:hook k :allowed (set (keys callback-hooks))})))
-        (gobj/set o js-name
-                  (case arity
-                    1 (fn [logs] (f (logs->clj logs)))
-                    2 (fn [i logs] (f i (logs->clj logs)))
-                    3 (fn [e b logs] (f e b (logs->clj logs)))))))
-    (new tf/CustomCallback o)))
+   a promise (awaited). `yield-every` (:auto :batch :epoch :never or ms)
+   decides when :on-yield fires — it is a constructor argument of tfjs's
+   CustomCallback, NOT read from the fit options, so fit! passes its own
+   :yield-every here (default :auto = every 125 ms of wall time, which a
+   short fit never reaches)."
+  ([hooks] (make-callback hooks nil))
+  ([hooks yield-every]
+   (let [o (js-obj)]
+     (doseq [[k f] hooks]
+       (let [[js-name arity] (get callback-hooks k)]
+         (when-not js-name
+           (throw (util/argument-error (str "unknown callback hook " (pr-str k)) {:hook k :allowed (set (keys callback-hooks))})))
+         (gobj/set o js-name
+                   (case arity
+                     1 (fn [logs] (f (logs->clj logs)))
+                     2 (fn [i logs] (f i (logs->clj logs)))
+                     3 (fn [e b logs] (f e b (logs->clj logs)))))))
+     (new tf/CustomCallback o (enum-arg yield-every)))))
 
 (defn early-stopping
   "Opaque EarlyStopping callback; `config` already translated ({:monitor
@@ -1428,12 +1449,13 @@
 
 (defn- callbacks-arg
   "A map of hooks, a vector of maps / opaque callbacks, or nil -> JS array of
-   BaseCallback instances (tfjs rejects mixed plain-object + instance lists)."
-  [cbs]
+   BaseCallback instances (tfjs rejects mixed plain-object + instance lists).
+   Hook maps get the fit's `yield-every` so :on-yield fires as configured."
+  [cbs yield-every]
   (cond
     (nil? cbs) js/undefined
-    (map? cbs) (array (make-callback cbs))
-    (sequential? cbs) (to-array (map (fn [c] (cond (map? c) (make-callback c)
+    (map? cbs) (array (make-callback cbs yield-every))
+    (sequential? cbs) (to-array (map (fn [c] (cond (map? c) (make-callback c yield-every)
                                                     (base-callback? c) c
                                                     :else (throw (util/argument-error "callbacks must be hook maps or callback objects" {:callback c}))))
                                      cbs))
@@ -1444,7 +1466,7 @@
   "Fit / fit-dataset option map -> JS args (callbacks bridged, tensors kept)."
   [opts]
   (let [o (->config-js (dissoc opts :callbacks :validation-data :class-weight))]
-    (when (contains? opts :callbacks) (gobj/set o "callbacks" (callbacks-arg (:callbacks opts))))
+    (when (contains? opts :callbacks) (gobj/set o "callbacks" (callbacks-arg (:callbacks opts) (:yield-every opts))))
     (when-let [vd (:validation-data opts)] (gobj/set o "validationData" (->js-container vd)))
     (when-let [cw (:class-weight opts)] (gobj/set o "classWeight" (->js-container cw)))
     o))
@@ -1543,7 +1565,17 @@
 (defn model-stop-training! "Asks a running fit to stop after the current epoch (call from a callback)." [model] (gobj/set model "stopTraining" true) nil)
 (defn model-stop-training? "True when a stop was requested." [model] (boolean (gobj/get model "stopTraining")))
 (defn model-reset-stop-training! "Clears the stop-training flag (fit clears it itself before starting)." [model] (gobj/set model "stopTraining" false) nil)
-(defn model-dispose! "Frees the model's weights; returns {:ref-count-after-dispose n :num-disposed-variables n}." [model] (guard #(js->kebab (js-invoke model "dispose"))))
+(defn model-dispose!
+  "Frees the model's weights and, unless `keep-optimizer?`, the attached
+   optimizer's tensors (tfjs's model.dispose leaves the optimizer alone;
+   see `optimizer-dispose!`). Returns {:ref-count-after-dispose n
+   :num-disposed-variables n}."
+  ([model] (model-dispose! model false))
+  ([model keep-optimizer?]
+   (let [r (guard #(js->kebab (js-invoke model "dispose")))]
+     (when-not keep-optimizer?
+       (when-let [o (gobj/get model "optimizer")] (optimizer-dispose! o)))
+     r)))
 (defn model-inputs "Vector of the model's symbolic inputs." [model] (vec (array-seq (gobj/get model "inputs"))))
 (defn model-outputs "Vector of the model's symbolic outputs." [model] (vec (array-seq (gobj/get model "outputs"))))
 (defn model-input-names "Vector of input layer names." [model] (js-array->clj (gobj/get model "inputNames")))
@@ -1600,10 +1632,22 @@
   [artifacts]
   (mapv js->kebab (array-seq (gobj/get artifacts "weightSpecs"))))
 
-(defn load-artifacts!
-  "Promise of a model loaded from opaque artifacts (in memory)."
+(defn artifacts-format
+  "\"layers-model\" (Keras / tfjs-layers) or \"graph-model\" (tfjs-converter
+   output) of opaque artifacts; nil when the model.json carries no format."
   [artifacts]
-  (async-guard #(tf/loadLayersModel ((gobj/get tf/io "fromMemory") artifacts))))
+  (gobj/get artifacts "format"))
+
+(defn load-artifacts!
+  "Promise of a layers model loaded from opaque artifacts (in memory).
+   Rejects with :tensorflow-cljs/io-error when the artifacts are a graph
+   model (tfjs would fail with an opaque \"Improper config format\"
+   ValueError): use `load-graph-artifacts!`."
+  [artifacts]
+  (if (= "graph-model" (artifacts-format artifacts))
+    (p/rejected (util/io-error "artifacts are a graph model (format \"graph-model\"): use load-graph! / load-graph-artifacts!"
+                               {:format "graph-model"}))
+    (async-guard #(tf/loadLayersModel ((gobj/get tf/io "fromMemory") artifacts)))))
 
 (defn- weight-data->array-buffer
   "ModelArtifacts.weightData (ArrayBuffer or ArrayBuffer[]) -> one ArrayBuffer."
@@ -1684,6 +1728,66 @@
    failures reject with :tensorflow-cljs/io-error."
   [url opts]
   (async-guard #(tf/loadLayersModel url (->config-js (or opts {})))))
+
+;; ---------------------------------------------------------------------------
+;; Graph models (tfjs-converter, inventory §4.7): inference only
+;; ---------------------------------------------------------------------------
+
+(defn graph-model?
+  "True for an opaque graph model (a converted SavedModel / Keras graph
+   loaded with `load-graph-artifacts!`; inference only, never trainable)."
+  [x]
+  (instance? tf/GraphModel x))
+
+(defn load-graph-artifacts!
+  "Promise of an opaque graph model from opaque artifacts whose format is
+   \"graph-model\" (a tensorflowjs_converter model.json + shards read with
+   `read-artifacts-from-dir!`). Rejects with :tensorflow-cljs/io-error for
+   layers artifacts (tfjs itself would crash reading `versions.producer`)."
+  [artifacts]
+  (if (= "graph-model" (artifacts-format artifacts))
+    (async-guard #(tf/loadGraphModel ((gobj/get tf/io "fromMemory") artifacts)))
+    (p/rejected (util/io-error (str "not a graph model (format " (pr-str (artifacts-format artifacts))
+                                    "): use load! / load-artifacts! for layers models")
+                               {:format (artifacts-format artifacts)}))))
+
+(defn load-graph-from-url!
+  "Promise of a graph model fetched from an http(s) URL of a model.json
+   (tfjs's own http handler); opts {:from-tf-hub :weight-path-prefix ..}."
+  [url opts]
+  (async-guard #(tf/loadGraphModel url (->config-js (or opts {})))))
+
+(defn graph-predict
+  "Opaque output tensor (vector for multi-output graphs) of a graph model
+   for `x`: a tensor, a vector of tensors in input-node order, or a map
+   keyed by input name; opts {:batch-size :verbose}."
+  [model x opts]
+  (guard #(->result (js-invoke model "predict" (->js-container x) (->config-js (or opts {}))))))
+
+(defn graph-execute
+  "Tensor (one name) or vector of tensors of the graph nodes named in
+   `output-names` for `x` (as in `graph-predict`). Synchronous: graphs with
+   control-flow / dynamic-shape ops need `graph-execute!`."
+  [model x output-names]
+  (guard #(->result (js-invoke model "execute" (->js-container x) (->js-container output-names)))))
+
+(defn graph-execute!
+  "Promise form of `graph-execute` (executeAsync: required for graphs with
+   control-flow or dynamic-shape ops)."
+  [model x output-names]
+  (-> (async-guard #(js-invoke model "executeAsync" (->js-container x) (->js-container output-names)))
+      (p/then ->result)))
+
+(defn- node-info [n]
+  {:name (gobj/get n "name")
+   :shape (let [s (gobj/get n "shape")] (when (array? s) (js-array->clj s)))
+   :dtype (some-> (gobj/get n "dtype") util/str->dtype)})
+
+(defn graph-inputs "Vector of {:name :shape :dtype} of the graph's input nodes (-1 = unknown dim)." [model] (mapv node-info (array-seq (gobj/get model "inputs"))))
+(defn graph-outputs "Vector of {:name :shape :dtype} of the graph's output nodes." [model] (mapv node-info (array-seq (gobj/get model "outputs"))))
+(defn graph-input-names "Vector of input node names." [model] (js-array->clj (gobj/get model "inputNodes")))
+(defn graph-output-names "Vector of output node names." [model] (js-array->clj (gobj/get model "outputNodes")))
+(defn graph-dispose! "Frees the graph model's weights; returns nil." [model] (guard #(js-invoke model "dispose")) nil)
 
 ;; ---------------------------------------------------------------------------
 ;; Data bridge (consumed by tensorflow-cljs.data)

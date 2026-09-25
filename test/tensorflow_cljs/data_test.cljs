@@ -1,6 +1,7 @@
 (ns tensorflow-cljs.data-test
   "tf.data pipelines: sources, combinators, consumers (node, no network)."
   (:require [cljs.test :refer [deftest is testing async]]
+            [cljs.core.async :as async :refer [<! go-loop]]
             [promesa.core :as p]
             [tensorflow-cljs.core :as tf]
             [tensorflow-cljs.data :as data]
@@ -182,4 +183,37 @@
          (is (= [[1 2] [3 4]] (mapv tf/->vec els)))
          (is (= [[1 2] [3 4]] (tf/->vec (first batched))) "tensor elements stack into one batch tensor")
          (is (= [[10 20] [30 40]] mapped) "map fns can read tensors out")))
+     done)))
+
+(deftest dataset-channel
+  (async done
+    (tu/finish
+     (let [ds (data/batch (data/from-vec [{:xs [1 2] :ys 0} {:xs [3 4] :ys 1} {:xs [5 6] :ys 0}]) 2)
+           boom-ds (fn [] (data/func (let [n (atom 0)] (fn [] (let [i (swap! n inc)] (if (< i 3) i (throw (ex-info "boom" {:i i}))))))))
+           before (tf/num-tensors)]
+       (p/let [batches (data/channel->vec! (data/->channel! ds))
+               plain (data/channel->vec! (data/->channel! (data/from-vec [1 2 3]) {:buffer 1}))
+               err (tu/rejection (data/channel->vec! (data/->channel! (boom-ds))))
+               ch (data/->channel! (data/repeat (data/from-vec [1 2 3])) {:buffer 2})
+               first-item (p/create (fn [resolve _] (async/take! ch resolve)))
+               _ (async/close! ch)
+               rest-items (data/channel->vec! ch)
+               raw (p/create (fn [resolve _]
+                               (let [ch (data/->channel! (boom-ds))]
+                                 (go-loop [acc []] (let [v (<! ch)] (if (nil? v) (resolve acc) (recur (conj acc v))))))))]
+         (is (= 2 (count batches)) "2 batches of a 3-element dataset")
+         (is (= [[1 2] [3 4]] (tf/->vec (:xs (first batches)))))
+         (is (= [[5 6]] (tf/->vec (:xs (second batches)))))
+         (is (= [1 2 3] plain) "buffer 1 delivers everything in order")
+         (is (re-find #"boom" (ex-message err)) "a throwing source rejects channel->vec! (tfjs prefixes the message)")
+         (is (= {:i 3} (ex-data err)) "the consumer's ex-info passes through")
+         (is (= 1 first-item) "unbounded dataset: first item taken")
+         (is (vector? rest-items) "closing the channel stops the producer; buffered items drain")
+         (is (<= (count rest-items) 3))
+         (is (= 3 (count raw)) "the error is the LAST item on the channel")
+         (is (= [1 2] (take 2 raw)))
+         (is (data/error? (last raw)))
+         (is (not (data/error? 1)))
+         (data/dispose-all! batches)
+         (is (= before (tf/num-tensors)) "no tensor leak after dispose-all!")))
      done)))

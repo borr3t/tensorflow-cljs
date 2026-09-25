@@ -133,26 +133,50 @@
          (is (number? (:loss (nth (first (:epoch-end by-kind)) 2))) "logs arrive as kebab maps of numbers")
          (is (contains? (nth (first (:batch-end by-kind)) 2) :batch))
          (is (= :train-begin (first (first evs))))
-         (is (= :train-end (first (last evs))))))
+         (is (= :train-end (first (last evs))))
+         ;; :on-yield follows the fit's :yield-every (a CustomCallback constructor
+         ;; argument in tfjs 4.22, where it fires ONLY for a numeric / :auto
+         ;; interval, debounced by wall time; :epoch / :batch merely yield to
+         ;; the event loop, :never + :on-yield throws in the constructor)
+         (p/let [yields (atom [])
+                 obj-yields (atom 0)
+                 epoch-yields (atom 0)
+                 _ (models/fit! m xor-x xor-y {:epochs 40 :batch-size 1 :yield-every 1
+                                               :callbacks [{:on-yield (fn [epoch batch logs] (swap! yields conj [epoch batch (contains? logs :loss)]))}
+                                                           (models/callback {:on-yield (fn [_ _ _] (swap! obj-yields inc))} {:yield-every 1})]})
+                 _ (models/fit! m xor-x xor-y {:epochs 3 :batch-size 2 :yield-every :epoch
+                                               :callbacks {:on-yield (fn [_ _ _] (swap! epoch-yields inc))}})
+                 never (tu/rejection (models/fit! m xor-x xor-y {:epochs 1 :yield-every :never
+                                                                  :callbacks {:on-yield (fn [_ _ _] nil)}}))]
+           (is (pos? (count @yields)) "on-yield fires with a 1 ms :yield-every over a multi-ms fit")
+           (is (every? true? (map last @yields)) "yield logs carry :loss")
+           (is (every? number? (map first @yields)) "epoch index")
+           (is (pos? @obj-yields) "a callback object with its own {:yield-every 1} yields too")
+           (is (zero? @epoch-yields) "tfjs 4.22: :yield-every :epoch never calls on-yield (inventory 6.1 correction)")
+           (is (= :tensorflow-cljs/tf-error (util/error-type never)) ":never + :on-yield is rejected by tfjs's CustomCallback constructor")
+           (is (re-find #"yieldEvery" (ex-message never))))))
      done)))
 
 (deftest early-stopping-and-stop-training
+  ;; NB: the three parts are chained in ONE p/let — as separate forms inside
+  ;; a let only the last one reached tu/finish and a rejected fit! went
+  ;; unnoticed (that hid the missing tf.BaseCallback export until the smoke).
   (async done
     (tu/finish
      (let [m (models/compile-model! (tiny-model) {:optimizer :sgd :loss :mse})
-           epochs (atom 0)]
+           epochs (atom 0)
+           seen (atom 0)]
        (p/let [h (models/fit! m xor-x xor-y {:epochs 5 :batch-size 4 :yield-every :never
                                              :callbacks [(models/early-stopping {:monitor :loss :patience 0 :min-delta 1e9})
                                                          {:on-epoch-end (fn [_ _] (swap! epochs inc))}
-                                                         (models/callback {:on-epoch-begin (fn [_ _] nil)})]})]
+                                                         (models/callback {:on-epoch-begin (fn [_ _] nil)})]})
+               h2 (models/fit! m xor-x xor-y {:epochs 5 :batch-size 4 :yield-every :never
+                                              :callbacks {:on-epoch-end (fn [epoch _] (swap! seen inc) (when (= 1 epoch) (models/stop-training! m)))}})]
          (is (<= (count (:epoch h)) 2) "early stopping with an impossible min-delta halts after the first check")
-         (is (= (count (:epoch h)) @epochs) "plain hook maps mix with callback objects"))
-       (p/let [seen (atom 0)
-               h (models/fit! m xor-x xor-y {:epochs 5 :batch-size 4 :yield-every :never
-                                             :callbacks {:on-epoch-end (fn [epoch _] (swap! seen inc) (when (= 1 epoch) (models/stop-training! m)))}})]
-         (is (= 2 (count (:epoch h))) "stop-training! ends after the current epoch")
-         (is (= 2 @seen)))
-       (is (= :tensorflow-cljs/argument-error (util/error-type (thrown #(models/callback {:on-bogus (fn [])}))))))
+         (is (= (count (:epoch h)) @epochs) "plain hook maps mix with callback objects")
+         (is (= 2 (count (:epoch h2))) "stop-training! ends after the current epoch")
+         (is (= 2 @seen))
+         (is (= :tensorflow-cljs/argument-error (util/error-type (thrown #(models/callback {:on-bogus (fn [])})))))))
      done)))
 
 (deftest evaluate-returns-metric-map
@@ -355,3 +379,66 @@
     (is (some #(re-find #"Non-trainable params: 9" %) (models/summary-lines m)) "freezing a layer moves its params")
     (is (= 2 (count (models/weights m true))))
     (is (string? (with-out-str (models/print-summary m))))))
+
+(defn- write-graph-model!
+  "Fabricates a tensorflowjs_converter-style graph model y = x * w + b
+   (w = [2 3], b = 1, read from weights.bin) in `dir`."
+  [dir]
+  (tu/write-file!
+   (tu/join-path dir "model.json")
+   (str "{\"format\":\"graph-model\",\"generatedBy\":\"test\",\"convertedBy\":null,"
+        "\"modelTopology\":{\"node\":["
+        "{\"name\":\"x\",\"op\":\"Placeholder\",\"attr\":{\"dtype\":{\"type\":\"DT_FLOAT\"},\"shape\":{\"shape\":{\"dim\":[{\"size\":\"-1\"},{\"size\":\"2\"}]}}}},"
+        "{\"name\":\"w\",\"op\":\"Const\",\"attr\":{\"dtype\":{\"type\":\"DT_FLOAT\"},\"value\":{\"tensor\":{\"dtype\":\"DT_FLOAT\",\"tensorShape\":{\"dim\":[{\"size\":\"2\"}]}}}}},"
+        "{\"name\":\"b\",\"op\":\"Const\",\"attr\":{\"dtype\":{\"type\":\"DT_FLOAT\"},\"value\":{\"tensor\":{\"dtype\":\"DT_FLOAT\",\"tensorShape\":{\"dim\":[]}}}}},"
+        "{\"name\":\"mul\",\"op\":\"Mul\",\"input\":[\"x\",\"w\"],\"attr\":{\"T\":{\"type\":\"DT_FLOAT\"}}},"
+        "{\"name\":\"y\",\"op\":\"Add\",\"input\":[\"mul\",\"b\"],\"attr\":{\"T\":{\"type\":\"DT_FLOAT\"}}}],"
+        "\"versions\":{\"producer\":1}},"
+        "\"signature\":{\"inputs\":{\"x\":{\"name\":\"x:0\",\"dtype\":\"DT_FLOAT\",\"tensorShape\":{\"dim\":[{\"size\":\"-1\"},{\"size\":\"2\"}]}}},"
+        "\"outputs\":{\"y\":{\"name\":\"y:0\",\"dtype\":\"DT_FLOAT\"}}},"
+        "\"weightsManifest\":[{\"paths\":[\"./weights.bin\"],\"weights\":[{\"name\":\"w\",\"shape\":[2],\"dtype\":\"float32\"},{\"name\":\"b\",\"shape\":[],\"dtype\":\"float32\"}]}]}"))
+  (tu/write-float32-file! (tu/join-path dir "weights.bin") [2 3 1]))
+
+(deftest graph-model-load-and-predict
+  (async done
+    (let [dir (tu/temp-dir! "tfcljs-graph-")
+          layers-dir (tu/join-path dir "layers")]
+      (write-graph-model! dir)
+      (tu/finish
+       (let [x2 (tf/tensor [[1 1] [2 5]])
+             x1 (tf/tensor [[1 1]])
+             x0 (tf/tensor [[0 1]])
+             tm (tiny-model)]
+        (p/let [g (models/load-graph! dir)
+               g2 (models/load-graph! (str "file://" (tu/join-path dir "model.json")))
+               before (tf/num-tensors)
+               out (models/graph-predict g x2)
+               out! (models/graph-predict! g2 x0)
+               mul (models/graph-execute g {"x" x1} ["mul"])
+               mul! (models/graph-execute! g x1 ["mul" "y"])
+               wrong (tu/rejection (models/load! dir))
+               _ (models/save! tm layers-dir)
+               wrong2 (tu/rejection (models/load-graph! layers-dir))
+               missing (tu/rejection (models/load-graph! (tu/join-path dir "nope")))]
+         (is (models/graph-model? g))
+         (is (not (models/graph-model? tm)))
+         (is (not (models/model? g)) "a graph model is not a layers model")
+         (is (= [[3 4] [5 16]] (tf/->vec out)) "y = x * [2 3] + 1")
+         (is (= [[1 4]] (tf/->vec out!)))
+         (is (= [[2 3]] (tf/->vec mul)) "intermediate node by name, named-map input")
+         (is (= 2 (count mul!)))
+         (is (= [[3 4]] (tf/->vec (second mul!))))
+         (is (= ["x"] (models/graph-input-names g)))
+         (is (= ["y"] (models/graph-output-names g)))
+         (is (= [{:name "x" :shape [-1 2] :dtype :float32}] (models/graph-inputs g)))
+         (is (= "y" (:name (first (models/graph-outputs g)))))
+         (is (= :tensorflow-cljs/io-error (util/error-type wrong)) "load! refuses a graph model")
+         (is (re-find #"load-graph!" (ex-message wrong)))
+         (is (= :tensorflow-cljs/io-error (util/error-type wrong2)) "load-graph! refuses a layers model")
+         (is (re-find #"layers-model" (ex-message wrong2)))
+         (is (= :tensorflow-cljs/io-error (util/error-type missing)))
+         (tf/dispose! [out out! mul mul!])
+         (is (= before (tf/num-tensors)) "outputs disposed")
+         (is (nil? (models/graph-dispose! g)))
+         (is (= (- before 2) (tf/num-tensors)) "graph weights (w, b) freed")))
+       (fn [] (tu/rm-rf! dir) (done))))))

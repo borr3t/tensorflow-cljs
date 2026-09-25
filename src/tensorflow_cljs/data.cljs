@@ -2,7 +2,8 @@
   "tf.data pipelines under node (inventory §5): sources (`from-vec`,
    `generator`, `func`, `csv`, `zip`), combinators (`batch` `map` `filter`
    `shuffle` `repeat` `take` `skip` `prefetch` `concatenate`) and consumers
-   (`to-vec!` `for-each!` `iterator!` `next!` `->batches!`). Datasets and
+   (`to-vec!` `for-each!` `iterator!` `next!` `->batches!` and the
+   core.async `->channel!`). Datasets and
    iterators are OPAQUE values; elements cross the boundary as ClojureScript
    maps (keys become keywords verbatim: {:xs .. :ys ..}), vectors, numbers,
    strings and opaque tensors. Every consumer returns a promesa promise
@@ -13,7 +14,9 @@
 
    No JavaScript interop here — everything goes through tensorflow-cljs.core."
   (:refer-clojure :exclude [map filter shuffle repeat take array])
-  (:require [promesa.core :as p]
+  (:require [cljs.core.async :as async :refer [<! alts! go go-loop]]
+            [cljs.core.async.impl.protocols :as impl]
+            [promesa.core :as p]
             [tensorflow-cljs.core :as core]
             [tensorflow-cljs.util :as util]))
 
@@ -101,7 +104,8 @@
 
 (defn repeat
   "Repeats the dataset `count` times; (repeat ds) repeats forever (size
-   ##Inf: fit-dataset! then needs :batches-per-epoch)."
+   ##Inf when the size was known, still nil when it was unknown:
+   fit-dataset! then needs :batches-per-epoch either way)."
   ([ds] (core/dataset-repeat ds nil))
   ([ds count] (core/dataset-repeat ds count)))
 
@@ -155,6 +159,90 @@
   "Promise of the column-name vector of a `csv` dataset."
   [ds]
   (core/csv-column-names! ds))
+
+;; ---------------------------------------------------------------------------
+;; core.async channel (house pattern shared with the leveldb-cljs iterators)
+;; ---------------------------------------------------------------------------
+
+(def default-channel-buffer
+  "Channel buffer size of `->channel!` when :buffer is not given."
+  32)
+
+(def cancel-poll-ms
+  "How long a parked put waits before re-checking whether the consumer
+   closed the channel (core.async: closing a channel does not wake parked
+   puts, so a producer parked on a full buffer must poll)."
+  100)
+
+(defn error?
+  "True when a channel item is an error rather than a dataset element: an
+   ex-info — tensorflow-cljs's own (:tensorflow-cljs/tf-error ..) or one
+   thrown by consumer code inside `map` / `func` / `generator`, which passes
+   through unchanged (tfjs prefixes its message with \"Error thrown while
+   iterating through a dataset\")."
+  [x]
+  (instance? ExceptionInfo x))
+
+(defn- promise->ch
+  "Bridges a promise to a promise-chan delivering [:ok v] or [:error e]."
+  [prom]
+  (let [ch (async/promise-chan)]
+    (-> (p/promise prom)
+        (p/then (fn [v] (async/put! ch [:ok v])))
+        (p/catch (fn [e] (async/put! ch [:error e]))))
+    ch))
+
+(defn- put-or-cancel!
+  "Puts `v` on `ch`; yields true when delivered, false when the consumer
+   closed `ch` (checked immediately and on every cancel-poll-ms tick while
+   the put is parked)."
+  [ch v]
+  (go-loop []
+    (let [[res port] (alts! [[ch v] (async/timeout cancel-poll-ms)])]
+      (cond
+        (identical? port ch) (boolean res)
+        (impl/closed? ch) false
+        :else (recur)))))
+
+(defn ->channel!
+  "core.async channel of the dataset's elements in order (batches when the
+   dataset was batched), closed after the last one; opts {:buffer 32}. An
+   error (iterator rejection) arrives as the LAST item — test with `error?`
+   — and the channel closes. Closing the channel stops the producer: the
+   element that could not be delivered is disposed, elements already in
+   the buffer can still be taken (drain them, then `dispose-all!`). Elements
+   taken from the channel belong to the consumer. Elements are pulled one at
+   a time (tf.data is promise-per-element), so the buffer only smooths
+   bursts."
+  ([ds] (->channel! ds nil))
+  ([ds {:keys [buffer] :or {buffer default-channel-buffer}}]
+   (let [ch (async/chan buffer)]
+     (go
+       (let [[tag it] (<! (promise->ch (core/dataset-iterator! ds)))]
+         (if (= :error tag)
+           (do (<! (put-or-cancel! ch it)) (async/close! ch))
+           (loop []
+             (let [[tag r] (<! (promise->ch (core/iterator-next! it)))]
+               (cond
+                 (= :error tag) (do (<! (put-or-cancel! ch r)) (async/close! ch))
+                 (:done r) (async/close! ch)
+                 (nil? (:value r)) (recur)
+                 (<! (put-or-cancel! ch (:value r))) (recur)
+                 :else (core/dispose! (:value r))))))))
+     ch)))
+
+(defn channel->vec!
+  "Drains a `->channel!` channel into a promise of a vector of elements; an
+   error item rejects the promise (the elements before it are disposed)."
+  [ch]
+  (p/create
+   (fn [resolve reject]
+     (go-loop [acc []]
+       (let [v (<! ch)]
+         (cond
+           (nil? v) (resolve acc)
+           (error? v) (do (core/dispose! acc) (reject v))
+           :else (recur (conj acc v))))))))
 
 (defn dispose-all!
   "Disposes every tensor inside a materialised element vector (`to-vec!`,

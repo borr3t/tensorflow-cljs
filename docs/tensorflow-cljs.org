@@ -1,0 +1,1122 @@
+#+TITLE: tensorflow-cljs Manual
+#+SUBTITLE: A ClojureScript (Node.js) binding of TensorFlow.js — tensors, the op algebra, layers and models, tf.data pipelines, save / load; kebab-case maps in and out, opaque tensors, promesa promises
+#+DATE: 2026-09-25
+#+OPTIONS: toc:2 num:t ^:nil
+#+LANGUAGE: en
+
+* Introduction
+
+=tensorflow-cljs= is an idiomatic ClojureScript (Node.js) binding of
+[[https://www.tensorflow.org/js][TensorFlow.js]] (=@tensorflow/tfjs= 4.22.0, the pure-JavaScript package with the
+CPU backend). Its point is not the tfjs call — =tf.layers.dense({units: 4})= is already
+short — but *what crosses the boundary*: ClojureScript data on the way in, ClojureScript
+data on the way out, and an opaque value in between that you never have to unwrap:
+
+- *configs are kebab-case keyword maps*: ={:units 4 :activation :relu :kernel-initializer
+  :glorot-uniform}= becomes tfjs's ={units: 4, activation: "relu", kernelInitializer:
+  "glorotUniform"}=; histories, logs and memory reports come back as ={:val-loss [...]
+  :num-tensors 3}=;
+- *tensors are opaque values*: the library never converts a tensor to ClojureScript data
+  unless you ask (=->vec=, =data-sync=), never exposes a tfjs class, and never lets tfjs walk
+  a persistent data structure;
+- *asynchronous tfjs calls are promesa promises* (=fit!=, =save!=, =load!=, dataset consumers);
+  the op algebra, =predict= and =evaluate= stay synchronous, with =predict!= / =evaluate!=
+  promise twins.
+
+It covers the whole main tfjs surface:
+
+- *The tensor core* (=tensorflow-cljs.core=) — creation from ClojureScript data with
+  =:dtype= keywords, readers, memory management (=tidy= / =dispose!= / =memory=), the whole
+  op algebra of tfjs-core (every one of the 207 top-level ops plus the =image=, =linalg=,
+  =losses=, =signal=, =sparse=, =string= and =fused= namespaces), backend and environment
+  control, optimizers and gradients for custom training loops.
+- *Layers* (=tensorflow-cljs.layers=) — the 66 layer constructors of tfjs-layers plus its 10
+  pooling aliases, initializer / regularizer / constraint objects, symbolic inputs and
+  =apply-layer= for functional graphs; the registries are plain data.
+- *Models* (=tensorflow-cljs.models=) — sequential and functional models, =compile-model!=
+  with keyword registries for optimizers / losses / metrics, =fit!= with callback maps and
+  early stopping, =predict= / =evaluate=, =fit-dataset!=, summaries and weights, =save!= /
+  =load!= through the library's own node-fs handler (pure tfjs has none), in-memory
+  artifacts, topology JSON, and inference-only graph models (=load-graph!=).
+- *Data pipelines* (=tensorflow-cljs.data=) — =tf.data= sources (vectors, generators,
+  functions, CSV files, zip), the combinators, promise consumers and a core.async channel.
+
+It is meant to be consumed *as a source dependency* by another shadow-cljs Node app
+(namespace prefix =tensorflow-cljs.*=) and follows the house contract shared with
+=leveldb-cljs=, =sqlite-cljs=, =openrouter-cljs= and the other =*-cljs= siblings:
+
+- *Kebab-cased keyword maps in and out.* Keys become camelCase, keyword values become the
+  tfjs registry strings (with the one =:gelu-new= → ="gelu_new"= exception), results come
+  back kebab-cased. Layer names (="dense_Dense1"=) and weight names are *values* and stay
+  verbatim.
+- *No JavaScript interop at call sites.* Every =js/=, =js-invoke=, =goog.object=, =#js= and
+  =clj->js= that touches tfjs (or node =fs=) lives in the single namespace
+  =tensorflow-cljs.core=; =layers=, =models= and =data= are plain ClojureScript over it. There
+  is no =^js= hint anywhere.
+- *promesa promises* for every asynchronous operation; compose with =p/let=, =p/->=,
+  =p/catch=.
+- *One npm runtime dependency*: =@tensorflow/tfjs= itself. promesa is a Clojars dependency;
+  core.async ships with shadow-cljs.
+- *Structured errors.* Every throw and every rejection is an =ex-info= with a =:type= in a
+  four-value taxonomy; tfjs's own errors carry a =:code= classification and the original JS
+  error as =:cause=; see [[Error handling]].
+
+** The binding-namespace architecture
+
+Exactly one namespace knows there is a JavaScript library at all (inventory 9.1):
+
+| namespace                 | role                                                                                                   | interop |
+|---------------------------+--------------------------------------------------------------------------------------------------------+---------|
+| =tensorflow-cljs.util=    | kebab / camel translation, =->config=, dtypes, shapes, =ragged?=, error constructors and predicates      | none    |
+| =tensorflow-cljs.core=    | *the* binding: tensors, readers, memory, the op algebra, backend, optimizers / gradients, and the layer / model / io / data *bridges* the other namespaces call | tfjs + node fs/path |
+| =tensorflow-cljs.layers=  | layer catalog, registries, initializer / regularizer / constraint objects, =input=, =apply-layer=       | via core |
+| =tensorflow-cljs.models=  | sequential / functional models, compile / fit / predict / evaluate, callbacks, save / load, graph models | via core |
+| =tensorflow-cljs.data=    | tf.data sources, combinators, promise consumers, the core.async channel                                | via core |
+
+The bridge functions in =core= (=make-layer=, =model-fit!=, =dataset-batch=,
+=save-artifacts-to-dir!= …) are public so the sibling namespaces can call them; they take
+already-translated arguments and are listed in the [[API reference]] for completeness. The
+consumer-facing API is =core= for tensors and ops, and =layers= / =models= / =data= for the
+rest.
+
+Where this manual says "verified live" it refers to the phase-4 live smoke of 2026-09-25
+(=dev/tensorflow_cljs/smoke.cljs=: real compute on the CPU backend and real files under a
+fresh temporary directory, nine sections all passing in under two seconds — backend
+report, tensor round trips, op spot checks with memory accounting, XOR trained to 100 %
+and a linear regression, save / load round trips including a fabricated two-shard
+manifest and a fabricated graph model, callbacks, early stopping, a CSV pipeline through
+a core.async channel into training, and a clean memory report at the end). The research
+behind the library — the package census, the op / layer / model / data / io catalogs,
+the error taxonomy, pitfalls and the numbered uncertainties with the house position on
+each — is =docs/tensorflow-api-inventory.org=; "inventory 4.6" points there.
+
+** Pure tfjs on the CPU, tfjs-node as an opt-in
+
+The library targets =@tensorflow/tfjs= (pure JavaScript). Under Node.js only the =cpu=
+backend registers (=webgl= needs a WebGL context; inventory 7). That buys a zero-native
+install (=npm install= in ≈10 s, no postinstall download, no compiler) at
+JavaScript-speed compute: a 512×512 float32 matmul takes ≈0.6 s, a small MLP trains a
+few thousand samples per second, and a CNN over images is minutes, not seconds. For
+native speed the consumer installs =@tensorflow/tfjs-node= and requires it *before*
+=tensorflow-cljs.core=; it registers a =tensorflow= backend into the same tfjs-core and
+=(core/set-backend! "tensorflow")= selects it. That package is not a dependency of this
+library (zero-dep rule) and is not exercised by the tests; see [[Backend notes]].
+
+* Install and quick start
+
+** Requirements
+
+- Node.js 22+ (developed and smoked on Node 22.23.2; tfjs 4.22 has no =engines= field).
+- Java 11+ for shadow-cljs.
+- =@tensorflow/tfjs= in the *consumer's* =node_modules= (=npm install @tensorflow/tfjs=,
+  272 MB under =node_modules/@tensorflow/=). shadow's Node targets leave npm requires
+  external, so the consumer's copy is the one loaded.
+
+** Source dependency
+
+The library is not published to a Maven repository; consume it as a git or local source
+dependency. Its own =deps.edn= declares ClojureScript, core.async and promesa, so a
+consumer's =deps.edn= only needs:
+
+#+begin_src clojure
+{:deps {io.github.borr3t/tensorflow-cljs {:local/root "../tensorflow-cljs"}
+        ;; or, once pushed, a git dep pinned to a sha:
+        ;; io.github.borr3t/tensorflow-cljs {:git/url "https://github.com/borr3t/tensorflow-cljs"
+        ;;                                   :git/sha "REPLACE-WITH-SHA"}
+        }}
+#+end_src
+
+The consumer's =shadow-cljs.edn= uses =:deps true= so the classpath comes from =deps.edn=,
+and its =package.json= lists =@tensorflow/tfjs=. Then require the namespaces you need:
+
+#+begin_src clojure
+(ns my.app
+  (:require [promesa.core :as p]
+            [tensorflow-cljs.core :as tf]
+            [tensorflow-cljs.layers :as layers]
+            [tensorflow-cljs.models :as models]
+            [tensorflow-cljs.data :as data]
+            [tensorflow-cljs.util :as util]))
+#+end_src
+
+** First tensors
+
+#+begin_src clojure
+(def a (tf/tensor [[1 2] [3 4]]))            ; opaque, shape [2 2], dtype :float32
+(tf/shape a)                                 ; => [2 2]
+(tf/->vec (tf/mat-mul a (tf/tensor [[5 6] [7 8]])))
+;; => [[19 22] [43 50]]
+(tf/->vec (tf/add a 1))                      ; broadcasting => [[2 3] [4 5]]
+(tf/->vec (tf/equal a 2))                    ; bool => [[false true] [false false]]
+(tf/->vec (tf/tensor [1.9 -2.1] :int32))     ; => [1 -2]   (truncates)
+(tf/tidy (fn [] {:s (tf/sum (tf/square a))})) ; every tensor made inside is freed except :s
+#+end_src
+
+Numbers become float32 (=0.1= reads back as =0.10000000149011612=), booleans =bool=,
+strings =string=; the nesting gives the shape; ragged nesting is rejected before tfjs sees
+it. See [[Tensors]].
+
+** First model
+
+#+begin_src clojure
+(def xs (tf/tensor [[0 0] [0 1] [1 0] [1 1]]))
+(def ys (tf/tensor [[0] [1] [1] [0]]))
+
+(def m (models/sequential
+        [(layers/dense {:units 8 :activation :tanh :input-shape [2]
+                        :kernel-initializer {:type :glorot-uniform :seed 7}})
+         (layers/dense {:units 1 :activation :sigmoid})]))
+
+(models/compile-model! m {:optimizer {:type :adam :learning-rate 0.1}
+                          :loss :binary-crossentropy
+                          :metrics [:accuracy]})
+
+(p/let [history (models/fit! m xs ys {:epochs 150 :batch-size 4 :yield-every :never
+                                      :callbacks {:on-epoch-end (fn [epoch logs] nil)}})
+        _       (models/save! m "models/xor")          ; model.json + weights.bin
+        m2      (models/load! "models/xor")]
+  (println (last (get-in history [:history :loss])))  ; ≈ 0.0007 (verified live)
+  (println (models/evaluate m xs ys))                  ; => {:loss 0.0007 :acc 1}
+  (println (tf/->vec (models/predict m2 xs))))         ; identical to (models/predict m xs)
+#+end_src
+
+The seeded XOR network reaches 100 % accuracy in 150 epochs in ≈0.5 s on the CPU backend
+(verified live, also inside the test suite). The reloaded =m2= predicts identically but
+is *not* compiled: save with ={:include-optimizer true}= to get a compiled model back
+(see [[Save and load]]).
+
+** First pipeline
+
+#+begin_src clojure
+(def ds (-> (data/csv "data/xor.csv" {:column-configs {"label" {:is-label true}}})
+            (data/map (fn [{:keys [xs ys]}] {:xs [(:x1 xs) (:x2 xs)] :ys [(:label ys)]}))
+            (data/shuffle 8 {:seed "x"})
+            (data/batch 4)))
+
+(models/fit-dataset! m (data/repeat ds) {:epochs 2 :batches-per-epoch 2})
+
+(p/let [batches (data/channel->vec! (data/->channel! (data/take ds 2)))]   ; core.async channel
+  (tf/shape (:xs (first batches))))                                       ; => [4 2]
+#+end_src
+
+* Tensors
+
+** Creation
+
+=core/tensor= takes ClojureScript data — a number / boolean / string (a scalar), a flat
+vector, or nested vectors whose nesting gives the shape — and an optional second argument
+that is either a dtype keyword or an option map:
+
+#+begin_src clojure
+(tf/tensor 7)                                ; shape [], float32
+(tf/tensor [1 2 3] :int32)                   ; shape [3], int32
+(tf/tensor [[1 2] [3 4]])                    ; shape [2 2]
+(tf/tensor [1 2 3 4 5 6] {:shape [2 3]})     ; flat data reshaped (count must match)
+(tf/tensor [true false])                     ; bool
+(tf/tensor ["a" "bc"])                       ; string
+(tf/scalar 3.5) (tf/tensor2d [[1 2]])        ; rank-checked variants tensor1d .. tensor6d
+#+end_src
+
+Typed arrays (=Float32Array=, =Int32Array=, =Uint8Array=) are accepted as flat data. The
+other creation functions take a shape vector first and an option map or dtype last:
+=zeros=, =ones=, =fill=, =zeros-like=, =ones-like=, =eye=, =linspace=, =range=, =random-normal=,
+=random-standard-normal=, =truncated-normal=, =random-uniform=, =random-uniform-int=,
+=random-gamma=, =rand=, =multinomial=, =one-hot=, =complex=, =variable=, =clone=, =buffer=.
+Random functions take =:seed= (best-effort determinism on the CPU backend, inventory
+11.16); the test suite seeds and uses tolerances.
+
+Three argument errors are caught *before* tfjs is called (=:tensorflow-cljs/argument-error=):
+
+- *ragged data* — =[1 [2 3]]= or =[[1 2] [3 4 5] [6]]=. tfjs 4.22 does *not* check nesting
+  consistency (its =TENSORLIKE_CHECK_SHAPE_CONSISTENCY= flag defaults to false) and would
+  silently produce shape =[2]= with data =[1 2]=, resp. shape =[3 2]= (inventory 2.1); the
+  wrapper's =util/ragged?= check rejects it;
+- a =:shape= whose element count does not match the data;
+- an unknown =:dtype= (there is no =:float64=, =:int64=, =:uint8= or =:float16= in tfjs) or
+  =nil= data.
+
+** The dtype table and its traps
+
+| keyword     | storage (=data-sync=)  | =->vec= element             | trap                                                                                             |
+|-------------+----------------------+----------------------------+--------------------------------------------------------------------------------------------------|
+| =:float32=  | Float32Array         | number                     | *every ClojureScript number is rounded to float32 on entry*: =0.1= reads back as =0.10000000149011612= and =(= 0.1 x)= is false; integers above 2²⁴ lose precision. Use =test-util=-style tolerances. |
+| =:int32=    | Int32Array           | number                     | fractions truncate (=1.9= → =1=, =-2.1= → =-2=), out-of-range wraps (=2^31= → =-2147483648=); int32 ÷ int32 truncates (=7/2= → =3=) and stays int32 |
+| =:bool=     | Uint8Array (0 / 1)   | =true= / =false=             | tfjs's own =arraySync= gives =1= / =0=; the readers here map them to booleans (one extra pass on bool tensors only). =cast= to float32 gives =1.0= / =0.0= |
+| =:string=   | string[]             | string                     | numeric ops reject string tensors (=:shape-error=, "must be numeric tensor"); =bytes!= gives per-element UTF-8 |
+| =:complex64= | Float32Array, interleaved =[re im re im ..]= (2× the size) | flat interleaved vector | =->vec= and =data-sync= both return the interleaved flat data; read parts with =real= / =imag= (inventory 11.7); =fft= / =ifft= / =rfft= / =irfft= are the main users |
+
+Inference: numbers (integers included) → float32, booleans → bool, strings → string,
+typed arrays → their dtype. dtype promotion in ops: float32 + int32 → float32.
+
+** Opaque values
+
+The tfjs =Tensor= object itself is the opaque value; wrapping it would force an unwrap on
+every op call and break =tidy='s container walk (inventory 9.2). Consumers may only pass
+a tensor to library functions, test it with =tensor?= / =variable?=, and read it out.
+Equality is identity — compare through =->vec=. =->string= / =print= give tfjs's own
+rendering. Symbolic tensors, layers, models, optimizers, datasets, iterators, callbacks,
+artifacts and graph models are opaque the same way (=symbolic?=, =layer?=, =model?=,
+=optimizer?=, =dataset?=, =callback?=, =graph-model?=).
+
+** Reading out
+
+Every reader *copies* into ClojureScript data; the tensor is untouched.
+
+| fn                        | returns                                                                          |
+|---------------------------+----------------------------------------------------------------------------------|
+| =->vec= (alias =->clj=)     | nested vectors in the tensor's shape; a scalar gives the bare value (sync)         |
+| =->vec!=                   | promise of the same (for backends that need an async transfer)                    |
+| =data-sync= / =data!=       | the flat row-major vector / promise                                               |
+| =get-element t i j ..=     | one element by indices (a =TensorBuffer= read)                                     |
+| =bytes!=                   | promise of the raw bytes (a vector of byte values; per-element vectors for strings) |
+| =shape= =dtype= =rank= =size=  | metadata; =strides= follows tfjs (rank-1 entries, trailing 1 omitted: =[2 3 4]= → =[12 4]=) |
+| =disposed?=                | true once freed                                                                   |
+
+On the CPU backend =data-sync= is a plain memory read, so the synchronous forms are the
+natural default; the promise forms exist so code stays correct under tfjs-node or a GPU
+backend. A 10⁶-element tensor becomes a 10⁶-element vector — correct but not free
+(inventory 11.3); keep large data in tensors and read out what you need.
+
+** Buffers and variables
+
+=buffer= (a fresh mutable =TensorBuffer= of a shape) / =->buffer= (of an existing tensor)
+with =buffer-get=, =buffer-set!= and =buffer->tensor= are the element-wise construction
+path. =variable= creates a trainable =Variable= from a tensor or data; =assign!= replaces
+its value (same shape). Variables are *not* freed by =tidy=: =dispose!= them, or
+=dispose-variables!= frees every variable, model weights included.
+
+* The op algebra
+
+** Overview and how to read the census
+
+=tensorflow-cljs.core= exposes every op of tfjs-core as one ClojureScript function with a
+kebab name (=matMul= → =mat-mul=, =argMax= → =arg-max=, =conv2dTranspose= →
+=conv2d-transpose=, =logSumExp= → =log-sum-exp=). The op census is inventory 2.2: 207
+top-level ops grouped as creation (30), arithmetic (24), elementwise math (22),
+activations (12), reductions (15), comparison / logical (12), shape / geometry (44),
+linear algebra (8), convolution / pooling (15), recurrent cells (2), search / sort / sets
+(9), segment / sparse / ragged (5), signal (6) and misc (3), plus the namespaced groups
+which appear here as prefixed names: =image-*= (16), =linalg-*= (3), =losses-*= (9),
+=signal-*= (4), =sparse-*= (4), =string-*= (4) and =fused-*= (3). To find a tfjs op, kebab
+its name and look for it in the [[API reference]]; the docstring gives the argument order.
+
+Conventions:
+
+- *Positional arguments mirror tfjs.* Optional trailing arguments are optional arities:
+  =(sum x)=, =(sum x axis)=, =(sum x axis keep-dims)=; =axis= may be a number or a vector.
+- *A trailing option map* where tfjs has several optionals: =(conv2d x filter {:strides 1
+  :pad :same :data-format :nhwc})=, =(random-normal [2 2] {:mean 0 :std-dev 1 :seed 3})=,
+  =(mat-mul a b {:transpose-b true})=. Keywords become tfjs enum strings (=:same=,
+  =:channels-last= → ="channelsLast"=; data formats upper-case: =:nhwc= → ="NHWC"=).
+- *TensorLike everywhere.* Any argument that tfjs accepts as a tensor also accepts a
+  number or nested vector: =(add t 1)=, =(mat-mul t [[1 0] [0 1]])=. Conversion happens in
+  =core=; a ClojureScript vector never reaches tfjs as-is.
+- *Broadcasting* follows numpy rules for every binary arithmetic / comparison / logical
+  op; a mismatch throws a =:shape-error=.
+- *Results*: a tensor stays opaque; a tfjs array of tensors becomes a vector (=split=,
+  =unstack=, =linalg-qr= → =[q r]=); a tfjs =NamedTensorMap= becomes a kebab map of opaque
+  tensors: =(topk x 2)= → ={:values t :indices t}=, =moments= → ={:mean t :variance t}=,
+  =max-pool-with-argmax= → ={:result t :indexes t}=, the =sparse-*=, =string-*= and NMS
+  variants likewise.
+- *Async ops end in =!=* and return promises: =where!= (coordinates of true elements),
+  =boolean-mask!=, =in-top-k!=, =setdiff1d!=, =image-non-max-suppression!= and its
+  =-with-score!= / =-padded!= forms.
+
+** Selected examples
+
+#+begin_src clojure
+(def a (tf/tensor [[1 2] [3 4]]))
+(tf/->vec (tf/mat-mul a [[5 6] [7 8]]))                ; => [[19 22] [43 50]]   (verified live)
+(tf/->vec (tf/reshape (tf/range 0 6) [2 3]))            ; => [[0 1 2] [3 4 5]]
+(tf/->vec (tf/sum a))  (tf/->vec (tf/sum a 1))          ; => 10, [3 7]
+(tf/->vec (tf/softmax (tf/tensor [1 2 3])))             ; => [0.09 0.24 0.66]
+(tf/->vec (tf/arg-max a 1))                             ; => [1 1] (int32)
+(tf/->vec (:values (tf/topk (tf/tensor [1 5 3]) 2)))    ; => [5 3]
+(tf/->vec (tf/where (tf/greater a 2) a 0))              ; => [[0 0] [3 4]]
+(tf/->vec (tf/concat [a a] 1))                          ; => [[1 2 1 2] [3 4 3 4]]
+(tf/->vec (tf/one-hot [0 2] 3))                         ; => [[1 0 0] [0 0 1]] (int32)
+(tf/->vec (tf/cast (tf/equal a 2) :float32))            ; => [[0 1] [0 0]]
+(tf/->vec (tf/einsum "ij,jk->ik" a a))                  ; => [[7 10] [15 22]]
+(tf/->vec (tf/conv2d (tf/ones [1 4 4 1]) (tf/ones [2 2 1 1]) {:strides 2 :pad :valid}))
+;; => [[[[4] [4]] [[4] [4]]]]
+(tf/->vec (tf/image-resize-bilinear (tf/ones [1 2 2 1]) [4 4]))   ; shape [1 4 4 1]
+(tf/->vec (tf/real (tf/fft (tf/complex [1 0 0 0] [0 0 0 0]))))     ; => [1 1 1 1]
+(p/let [idx (tf/where! (tf/greater a 2))] (tf/->vec idx))          ; => [[1 0] [1 1]]
+#+end_src
+
+** Losses and metrics as functions
+
+=losses-mean-squared-error=, =losses-absolute-difference=, =losses-hinge-loss=,
+=losses-huber-loss=, =losses-log-loss=, =losses-cosine-distance=,
+=losses-sigmoid-cross-entropy=, =losses-softmax-cross-entropy= and
+=losses-compute-weighted-loss= take =(labels predictions & [{:weights t :reduction
+:mean}])= with the reduction keywords of =loss-reductions= (=:none= =:mean= =:sum=
+=:sum-by-nonzero-weights=). =(metric-fn "binaryAccuracy")= (also ="mse"= ="mae"= ="r2Score"=
+="recall"= …) returns a =(fn [y-true y-pred] tensor)= from =tf.metrics= for custom loops.
+
+** Custom training loops: optimizers and gradients
+
+Model training normally goes through =models/compile-model!= + =fit!=; the raw pieces are
+in =core= for custom loops:
+
+#+begin_src clojure
+(def w (tf/variable (tf/tensor 0)))
+(def opt (tf/make-optimizer "sgd" [0.1]))                 ; or (models/optimizer :sgd {:learning-rate 0.1})
+(tf/minimize! opt (fn [] (tf/square (tf/sub w 1))))       ; => 1 (the cost); w is now 0.2
+(tf/->vec w)                                              ; => 0.2
+
+((tf/grad (fn [x] (tf/square x))) (tf/tensor [3]))        ; => tensor [6]
+(tf/variable-grads (fn [] (tf/square (tf/sub w 1))))      ; => {:value t :grads {"Variable" t}}
+(tf/compute-gradients opt (fn [] ...)) (tf/apply-gradients! opt grads-map)
+#+end_src
+
+=grad=, =grads= (of several tensors), =value-and-grad=, =variable-grads= and =custom-grad=
+mirror tfjs; =minimize!= returns the cost as a number (the scalar is read and disposed)
+and updates every variable the function touched, or =:var-list=.
+
+* Memory
+
+tfjs tensors are not garbage-collected; only these free memory:
+
+| fn                     | effect                                                                                           |
+|------------------------+--------------------------------------------------------------------------------------------------|
+| =tidy [f]= / =[name f]=  | runs the zero-argument =f= in a scope; every tensor created inside is freed at the end *except* those reachable from the return value (a tensor or any ClojureScript / JS container of tensors: map, vector, set, seq, nested); returns =f='s value. =f= must be synchronous — an async body leaks. |
+| =keep [t]=               | exempts =t= from the enclosing =tidy=                                                              |
+| =dispose! [x]=           | frees a tensor, or every tensor reachable inside a container; returns nil. Using a freed tensor throws a =:tensorflow-cljs/tf-error= ("Tensor is disposed.") |
+| =dispose-variables!=     | frees every =Variable= (model weights and optimizer slots included)                                |
+| =models/dispose!= / =layers/dispose!= / =models/graph-dispose!= | free a model's / layer's / graph's weights; the first two return ={:ref-count-after-dispose :num-disposed-variables}= |
+| =memory=                 | ={:num-tensors :num-data-buffers :num-bytes :unreliable :reasons}=; on the CPU backend =:unreliable= is always true (the count is an upper bound) |
+| =num-tensors=            | the live tensor count — the leak detector of the test suite and the smoke                         |
+| =profile!= / =time!=      | promises of ={:new-bytes :new-tensors :peak-bytes :kernels :result}= / ={:kernel-ms :wall-ms}= for a function |
+
+Verified live: creating 12 tensors inside a =tidy= that returns a map ={:result t :count
+10}= leaves exactly one extra tensor; =dispose!= of that map restores the count.
+
+*The container-walk decision (inventory 11.4).* tfjs's own =tidy= and =dispose= walk the
+returned container with =for…in= over every enumerable property, which on a
+ClojureScript persistent map means walking its prototype machinery. =core/tidy= never lets
+tfjs walk ClojureScript data: it collects the tensors of the return value with a
+ClojureScript walk (maps, vectors, sets, seqs, JS arrays and objects), hands tfjs a plain
+JS array of them before the scope closes, and returns the original value to you.
+=dispose!= does the same. A 200-tensor map passes through =tidy= in a few milliseconds
+(the suite asserts under 250 ms).
+
+What the library itself takes care of: =models/evaluate= reads and disposes the metric
+scalars tfjs returns; =minimize!= disposes the cost scalar; =fit!= / =fit-dataset!= leave
+nothing behind (the suite and the smoke count). What is *yours*: the output of =predict=
+(and of every op), the tensors inside =data/to-vec!= / =->batches!= / channel results
+(=data/dispose-all!=), model weights (=models/dispose!=). One tfjs leak is documented
+rather than hidden: every =save!= with ={:include-optimizer true}= leaves one int32 scalar
+behind (the optimizer's iteration counter tfjs creates and never frees, probe-verified,
+inventory 4.6) — the smoke's final memory check tolerates exactly that one.
+
+* Layers
+
+** Registry and config translation
+
+Every layer constructor of tfjs-layers is a ClojureScript function taking one kebab
+config map:
+
+#+begin_src clojure
+(layers/dense {:units 4 :activation :relu :kernel-initializer :glorot-uniform :input-shape [2]})
+(layers/conv2d {:filters 8 :kernel-size [3 3] :padding :same :data-format :channels-last})
+(layers/lstm {:units 16 :return-sequences true :recurrent-activation :hard-sigmoid})
+(layers/dense {:units 4 :kernel-initializer {:type :random-normal :mean 0 :stddev 0.05 :seed 1}
+                        :kernel-regularizer {:type :l2 :l2 0.01}
+                        :kernel-constraint {:type :max-norm :max-value 2}})
+(layers/layer :dense {:units 4})              ; generic form, any key of layer-constructors
+#+end_src
+
+Translation (=util/->config=, inventory 9.4): keys become camelCase (=:kernel-initializer=
+→ =kernelInitializer=, =:input-shape= → =inputShape=), keyword values become registry
+strings (=:relu=, =:glorot-uniform= → ="glorotUniform"=, =:channels-last= →
+="channelsLast"=, =:gelu-new= → ="gelu_new"= — the one snake_case activation, inventory
+11.13), shapes stay numeric vectors, =nil= values are dropped. Before the config reaches
+=core=, =layers/prepare-config= validates =:activation= / =:recurrent-activation= against
+=layers/activations=, and turns =*-initializer= / =*-regularizer= / =*-constraint= values
+into opaque objects: a keyword is validated against the registry and passed as its
+string form, a map ={:type :random-normal ..}= is constructed with =layers/initializer= /
+=regularizer= / =constraint=, an opaque object passes through. Unknown identifiers throw
+=:tensorflow-cljs/argument-error= before tfjs is called; the registries themselves
+(=activations= 15, =initializers= 15, =regularizers= 3, =constraints= 4,
+=layer-constructors= 76) are plain maps you can read.
+
+Common base keys of every layer: =:input-shape= / =:batch-input-shape= (on the first layer
+of a sequential model), =:batch-size=, =:dtype=, =:name=, =:trainable=, =:weights= (a vector
+of tensors), =:input-d-type=.
+
+** The catalog (66 constructors + 10 aliases)
+
+| group                | constructors (kebab)                                                                                                   |
+|----------------------+------------------------------------------------------------------------------------------------------------------------|
+| input                | =input-layer=; plus =input= (a symbolic tensor, see below)                                                                |
+| advanced activations | =elu= =relu= =leaky-relu= =prelu= =softmax= =thresholded-relu=                                                              |
+| convolutional (9)    | =conv1d= =conv2d= =conv2d-transpose= =conv3d= =conv3d-transpose= =separable-conv2d= =depthwise-conv2d= =cropping2d= =up-sampling2d= |
+| core (10)            | =activation= =dense= =dropout= =spatial-dropout1d= =flatten= =repeat-vector= =reshape= =permute= =embedding= =masking=        |
+| merge (7)            | =add= =average= =concatenate= =maximum= =minimum= =multiply= =dot= — applied to a *vector* of inputs                          |
+| normalization (2)    | =batch-normalization= =layer-normalization=                                                                               |
+| padding (1)          | =zero-padding2d=                                                                                                         |
+| pooling (10 + 10 aliases) | =average-pooling1d/2d/3d= =max-pooling1d/2d/3d= =global-average-pooling1d/2d= =global-max-pooling1d/2d=; aliases =avg-pool1d/2d/3d= =avg-pooling1d/2d/3d= =max-pool1d/2d= =global-max-pool1d/2d= (=layers/layer-aliases=, same constructors under tfjs's alias exports) |
+| recurrent (10)       | =simple-rnn= =gru= =lstm= =simple-rnn-cell= =gru-cell= =lstm-cell= =conv-lstm2d= =conv-lstm2d-cell= =rnn= =stacked-rnn-cells=  |
+| wrappers (2)         | =bidirectional= =time-distributed=                                                                                        |
+| noise (3)            | =gaussian-noise= =gaussian-dropout= =alpha-dropout=                                                                        |
+| preprocessing (5)    | =rescaling= =center-crop= =resizing= =category-encoding= =random-width=                                                    |
+
+The per-layer config keys are in each function's docstring and in inventory 3.1. Not in
+tfjs 4.22 (so not here): =multi-head-attention=, =attention=, =conv1d-transpose=,
+=global-average-pooling3d=, =text-vectorization=, the adaptable =normalization= layer,
+=random-height= / =random-flip= / =random-rotation=.
+
+** Symbolic inputs and functional graphs
+
+#+begin_src clojure
+(def a (layers/input {:shape [2] :name "a"}))              ; symbolic, shape [nil 2]
+(def b (layers/input {:shape [3] :name "b"}))
+(def h (layers/apply-layer (layers/concatenate) [a b]))    ; merge layers take a vector
+(def out (layers/apply-layer (layers/dense {:units 1}) h))
+(def m (models/model {:inputs [a b] :outputs out}))
+(models/predict m [(tf/tensor [[1 2]]) (tf/tensor [[3 4 5]])])   ; multi-input predict takes a vector
+#+end_src
+
+=apply-layer= is dual: symbolic in → symbolic out (graph building), concrete tensor in →
+tensor out (eager use, e.g. =(layers/apply-layer (layers/dense {:units 2 :input-shape [3]})
+(tf/ones [1 3]))= gives a =[1 2]= tensor). An optional third argument passes kwargs such as
+={:training true}=. =symbolic-shape= / =symbolic-name= read a symbolic tensor; a layer's
+=output-shape= throws =:attribute-error= for a layer used only eagerly (it needs a graph
+node, inventory 3.2).
+
+** Accessors
+
+=weights= / =set-weights!= (vectors of tensors in tfjs order: kernel, bias, …),
+=count-params= (built layers), =config= (kebab =getConfig=), =layer-name= (unique,
+="dense_Dense1"=), =class-name= (="Dense"=), =trainable?= / =set-trainable!= (freezing),
+=built?= / =build!=, =output-shape= / =compute-output-shape= / =batch-input-shape= (nil is the
+batch dimension), =reset-states!= (stateful RNNs), =dispose!=.
+
+* Models
+
+** Sequential and functional
+
+#+begin_src clojure
+(models/sequential [(layers/dense {:units 8 :input-shape [2]}) (layers/dense {:units 1})] {:name "xor"})
+(-> (models/sequential) (models/add-layer! (layers/dense {:units 1 :input-shape [1]})))
+(models/pop-layer! m)
+(models/model {:inputs [a b] :outputs out :name "two-in"})     ; functional, see Layers
+#+end_src
+
+The first layer of a sequential model must carry =:input-shape= or =:batch-input-shape=
+(otherwise =:value-error=). =model?= / =sequential?= are the predicates; =layers=,
+=get-layer= (by name or 0-based index), =model-name=, =inputs= / =outputs= / =input-names= /
+=output-names=, =count-params=, =weights= / =set-weights!=, =summary= (one string) /
+=summary-lines= / =print-summary=, =to-json= (the Keras topology with string keys verbatim)
+and =model-from-json!= (fresh weights) are the introspection surface.
+
+** compile-model!
+
+#+begin_src clojure
+(models/compile-model! m {:optimizer :adam                               ; registry keyword, tfjs defaults
+                          :loss :mean-squared-error                      ; or :mse
+                          :metrics [:mae :accuracy]})
+(models/compile-model! m {:optimizer {:type :adam :learning-rate 0.01 :beta1 0.9}   ; explicit hyper-parameters
+                          :loss (fn [y-true y-pred] (tf/mean (tf/abs (tf/sub y-true y-pred))))
+                          :metrics {"dense_Dense2" [:accuracy]}})       ; per output name
+(models/compile-model! m {:optimizer (models/optimizer :momentum {:learning-rate 0.1 :momentum 0.9 :use-nesterov true})
+                          :loss [:mse :binary-crossentropy]})            ; per output, in order
+#+end_src
+
+Synchronous; returns the model; recompiling replaces the previous compilation. The
+three registries are data in =tensorflow-cljs.models=:
+
+| registry     | keywords                                                                                                                                                          | note |
+|--------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+------|
+| =optimizers= | =:sgd= =:adagrad= =:adadelta= =:adam= =:adamax= =:rmsprop= (bare: tfjs defaults — sgd 0.01, adam 0.001, adamax 0.002, rmsprop 0.001, adadelta 1, adagrad 0.01); =:momentum= only through =optimizer= / the map form | =optimizer-args= lists each constructor's positional arguments and defaults |
+| =losses=     | =:mean-squared-error= (=:mse=) =:mean-absolute-error= (=:mae=) =:mean-absolute-percentage-error= (=:mape=) =:mean-squared-logarithmic-error= (=:msle=) =:squared-hinge= =:hinge= =:categorical-hinge= =:logcosh= =:categorical-crossentropy= =:sparse-categorical-crossentropy= =:binary-crossentropy= =:kullback-leibler-divergence= (=:kld=) =:poisson= =:cosine-proximity= (=:cosine=) | *tfjs accepts camelCase strings only* at compile: ="mse"= and ="mean_squared_error"= are =ValueError "Unknown loss"= there (inventory 3.3). The keyword aliases are resolved by the wrapper to the long camelCase name; a string is passed verbatim. |
+| =metrics=    | every loss keyword plus =:accuracy= / =:acc= (resolved per output from the loss: binary / categorical / sparse-categorical), =:crossentropy= / =:ce=, =:binary-accuracy=, =:categorical-accuracy=, =:precision=, =:mse= =:mae= =:mape= =:cosine= (short metric names ARE valid in tfjs) | a function =(fn [y-true y-pred] tensor)= is accepted anywhere a keyword is |
+
+Unknown keywords throw =:tensorflow-cljs/argument-error= before tfjs is called; unknown
+*strings* reach tfjs and come back as =:value-error=. =metrics-names= (e.g. =["loss" "mae"
+"acc"]=) and =compiled?= read the state.
+
+** fit!
+
+#+begin_src clojure
+(p/let [h (models/fit! m xs ys {:epochs 150 :batch-size 4 :yield-every :never
+                                :validation-split 0.2               ; or :validation-data [xv yv]
+                                :shuffle true :class-weight {0 1 1 2}
+                                :callbacks {:on-epoch-end (fn [epoch logs] (println epoch (:loss logs)))}})]
+  (:epoch h)                        ; => [0 1 ... 149]
+  (get-in h [:history :loss])       ; => [0.74 ... 0.0007]   (:val-loss :acc :val-acc when present)
+  (:params h))                      ; => {:epochs 150 :batch-size 4 ...}
+#+end_src
+
+Options (kebab, tfjs defaults unless noted): =:epochs= 1, =:batch-size= 32, =:verbose= 0
+(*wrapper default*; 1 prints tfjs's progress bar with terminal escapes, inventory 11.11),
+=:shuffle= true, =:validation-split= (a fraction taken from the *end* of the data),
+=:validation-data= =[xv yv]= or =[xv yv sample-weights]=, =:class-weight=, =:sample-weight=,
+=:initial-epoch=, =:steps-per-epoch=, =:yield-every= =:auto= (yield to the event loop every
+125 ms) / =:batch= / =:epoch= / =:never= (fastest for batch jobs) / a number of ms. =x= / =y=
+are tensors, vectors of tensors (multi-input / multi-output) or maps keyed by input name.
+A second =fit!= on a model while one is running rejects (tfjs's own guard: "Cannot start
+training because another fit() call is ongoing"); =fit!= on an uncompiled model rejects
+with =:runtime-error=. =train-on-batch!= does one gradient step and resolves to the loss
+(or =[loss metric ..]=).
+
+** Callbacks as ClojureScript maps
+
+A callback is a map of hook functions; =fit!= / =fit-dataset!= take one map, or a vector
+mixing maps with =early-stopping= objects:
+
+| key              | arguments                       |
+|------------------+---------------------------------|
+| =:on-train-begin= / =:on-train-end= | =(fn [logs])=          |
+| =:on-epoch-begin= / =:on-epoch-end= | =(fn [epoch logs])=    |
+| =:on-batch-begin= / =:on-batch-end= | =(fn [batch logs])=    |
+| =:on-yield=      | =(fn [epoch batch logs])=       |
+
+=logs= arrives as a kebab map of numbers (=:loss=, =:acc=, =:val-loss=, =:batch=, =:size= …;
+tfjs resolves its scalars before calling you). A hook may return a promise, which is
+awaited (verified live with a 20 ms delay). Every map is wrapped in a tfjs
+=CustomCallback= by the library: tfjs itself refuses a list that mixes plain objects with
+callback instances (=TypeError "callback.setParams is not a function"=, inventory 6.1),
+and the umbrella does not even export =BaseCallback= (inventory 11b.1).
+
+*=:on-yield= is special* (inventory 11b.2): in tfjs 4.22 it fires only when =:yield-every= is
+a number of milliseconds or =:auto= (125 ms), debounced by wall time; =:epoch= and =:batch=
+only yield to the event loop and never call it; =:never= together with an =:on-yield= hook is
+rejected by tfjs ("yieldEvery is `never` but you provided an `onYield` callback"). The
+interval is a constructor argument of the tfjs callback object, so the maps you pass to
+=fit!= inherit the fit's =:yield-every=; a standalone object from =(models/callback hooks
+{:yield-every 1})= carries its own.
+
+=stop-training!= from any hook ends training after the current epoch (verified live: a
+stop at epoch index 2 gives a 3-epoch history).
+
+** Early stopping
+
+#+begin_src clojure
+(models/fit! m xs ys {:epochs 200 :validation-data [xv yv]
+                      :callbacks [(models/early-stopping {:monitor :val-loss :patience 1 :min-delta 0
+                                                          :mode :auto :restore-best-weights false})
+                                  {:on-epoch-end (fn [e logs] nil)}]})
+#+end_src
+
+=:monitor= is a history key (=:val-loss= default, =:loss=, =:acc= …; the wrapper writes the
+snake_case name tfjs expects). Verified live: with validation labels deliberately
+flipped, patience 1 stops a 200-epoch fit after 2 epochs.
+
+** predict and evaluate: sync and promise twins
+
+| sync                          | promise twin          | returns                                                                 |
+|-------------------------------+-----------------------+-------------------------------------------------------------------------|
+| =predict [m x & [opts]]=      | =predict!=            | an opaque output tensor (a vector for multi-output models) — *yours to dispose*; float32 even for int32 input; =opts= =:batch-size= |
+| =predict-on-batch [m x]=      | =predict-on-batch!=   | one batch, no internal batching                                          |
+| =evaluate [m x y & [opts]]=   | =evaluate!=           | ={:loss 0.0007 :acc 1}= keyed by =metrics-names=; the tfjs scalars are read and disposed |
+| =execute [m x output-names]=  |                       | vector of intermediate output tensors by *layer name* (the wrapper resolves it to the symbolic tensor name tfjs wants, inventory 4.5) |
+
+tfjs runs =predict= / =evaluate= synchronously; the =!= forms exist so a call site can stay
+uniform with =fit!= and get a rejection instead of a throw. Unlike =fit=, tfjs's =predict=
+does not take an input-name map: multi-input models take a vector of tensors.
+
+** Save and load
+
+#+begin_src clojure
+(p/let [saved (models/save! m "models/xor")                             ; => {:dir :model-json :weights-bin :model-artifacts-info}
+        _     (models/save! m "models/xor-opt" {:include-optimizer true})
+        m2    (models/load! "models/xor")                                ; not compiled
+        m3    (models/load! "models/xor-opt/model.json")                  ; compiled: metrics-names restored, fit! works
+        m4    (models/load! "file:///abs/path/models/xor")]
+  ...)
+#+end_src
+
+Pure tfjs registers no =file://= handler under Node (=save('file://…')= rejects "Cannot
+find any save handlers", =loadLayersModel('file://…')= falls through to fetch and rejects
+"fetch failed"; inventory 4.6). The library ships its own node-fs handler in =core=,
+writing the layout tfjs-node and =tensorflowjs_converter= use:
+
+- =model.json= — ={modelTopology, format, generatedBy, convertedBy, trainingConfig?,
+  weightsManifest: [{paths: ["./weights.bin"], weights: [specs]}], userDefinedMetadata?,
+  signature?}=;
+- =weights.bin= — one shard, every weight's float32 bytes concatenated in spec order.
+
+=load!= accepts a directory, a =model.json= path or a =file://= URL, reads every shard of
+every manifest group in manifest order and concatenates them (a two-shard manifest is
+exercised by the suite and the smoke, inventory 11.6), decodes quantized weights through
+tfjs, and rejects with =:tensorflow-cljs/io-error= naming the missing =model.json= or
+shard. =http(s)://= URLs go to tfjs's own fetch handler (=opts= =:strict=,
+=:weight-path-prefix=, =:from-tf-hub= …); a network failure is an =:io-error=.
+
+*=:include-optimizer= semantics* (inventory 11.9): a default save stores topology, weights
+and =userDefinedMetadata= only; the loaded model predicts identically (bit-for-bit,
+verified live) but is *not compiled* — =compile-model!= it before =fit!= (otherwise
+=:runtime-error=). ={:include-optimizer true}= adds the training config and the optimizer
+state; the loaded model is compiled, =metrics-names= is restored and =fit!= continues
+training. The price: the weight file grows by the optimizer slots, and tfjs leaks one
+int32 scalar per such save (inventory 11b.4). ={:trainable-only true}= drops frozen weights.
+
+In-memory: =save-artifacts!= → opaque artifacts → =load-artifacts!= round-trips inside one
+process; =artifacts-info= (={:date-saved :model-topology-bytes :weight-data-bytes ..}=) and
+=weight-specs= (=[{:name "dense_Dense1/kernel" :shape [2 8] :dtype "float32"} ..]=) inspect
+them. =set-user-metadata!= / =user-metadata= attach a JSON-able map that survives the file
+round trip (string keys are kept verbatim).
+
+** Graph models (inference only)
+
+A =tensorflowjs_converter= export of a SavedModel or Keras HDF5 is a *graph* model
+(=format "graph-model"= in its =model.json=). It cannot be compiled or trained, only run:
+
+#+begin_src clojure
+(p/let [g (models/load-graph! "models/mobilenet")]            ; directory / model.json / file:// / http(s)
+  (models/graph-input-names g)                               ; => ["x"]
+  (models/graph-inputs g)                                    ; => [{:name "x" :shape [-1 2] :dtype :float32}]
+  (tf/->vec (models/graph-predict g (tf/tensor [[1 1]])))    ; a tensor, a vector (input-node order) or {"x" tensor}
+  (models/graph-execute g x ["mul" "y"])                     ; intermediate nodes by name
+  (models/graph-execute! g x ["y"])                          ; promise form, needed for control-flow graphs
+  (models/graph-dispose! g))
+#+end_src
+
+The loader is the same artifacts reader as =load!= (shards concatenated, then
+=loadGraphModel= on in-memory artifacts), so it is offline and needs no handler. =load!=
+on a graph model and =load-graph!= on a layers model both reject with =:io-error= naming
+the right function, because tfjs's own failures for the crossed cases are opaque
+(inventory 11b.6). Verified live with a fabricated five-node graph (y = x·w + b with w
+and b read from =weights.bin=). Custom ops (=registerOp=) are not exposed.
+
+* Data pipelines
+
+** Sources
+
+| fn                              | element                                                                                              | size  |
+|---------------------------------+------------------------------------------------------------------------------------------------------+-------|
+| =from-vec [items]= (alias =array=) | each item as given: numbers, strings, tensors, vectors, maps like ={:xs [1 2] :ys 0}=                  | count |
+| =generator [f]=                 | =(f)= is called afresh per iteration and returns a (lazy, possibly infinite) seq                      | nil   |
+| =func [f]=                      | =(f)= is called per element until it returns nil; it may return a promise                             | nil   |
+| =csv [path-or-url & [config]]=  | a local path (="file://"= added) or http(s) URL; rows ={:x1 1 :x2 2 :label 0}=, or ={:xs {..} :ys {:label 0}}= when a label column is configured | nil |
+| =zip [container]=               | ={:a ds :b ds}= → ={:a .. :b ..}=; =[ds ds]= → =[.. ..]=                                                    |       |
+
+CSV config: ={:has-header true :column-names [..] :column-configs {"label" {:is-label true
+:dtype :int32 :required true :default 0}} :configured-columns-only false :delimiter ","
+:delim-whitespace false}=; column names are strings (keywords would be camelised).
+=column-names!= reads the header.
+
+** Combinators
+
+=batch [ds n & [small-last?]]= stacks =n= elements column-wise (elements ={:xs [2] :ys [1]}=
+become ={:xs tensor[n 2] :ys tensor[n 1]}=; bare numbers become a rank-1 tensor),
+=map [ds f]= / =map! [ds f]= (=f= receives the element as ClojureScript data with tensors
+opaque and returns a map / vector / number / tensor; =map!= for a promise-returning =f=),
+=filter=, =shuffle [ds buffer-size & [{:seed "string" :reshuffle-each-iteration true}]]=,
+=repeat [ds & [count]]=, =take=, =skip=, =prefetch=, =concatenate=. All are pure (a new opaque
+dataset). =size= is the static estimate: a number, nil when unknown (generator, func, csv,
+after =filter=) or =##Inf= after an unbounded =repeat= of a known size (an unknown size stays
+nil, inventory 11b.5). =max-buffer-size= (10000) caps shuffle / prefetch buffers.
+
+** Consumers
+
+| fn                     | returns                                                                                     |
+|------------------------+---------------------------------------------------------------------------------------------|
+| =to-vec! [ds]=         | promise of a vector of every element (never on an unbounded dataset)                        |
+| =for-each! [ds f]=     | promise resolving after =f= ran on every element (=f= may return a promise)                    |
+| =iterator! [ds]= / =next! [it]= | opaque iterator / promise of ={:value element :done bool}=                            |
+| =->batches! [ds n]=    | promise of a vector of ={:xs tensor :ys tensor}= batches for custom loops                    |
+| =->channel! [ds & [{:buffer 32}]]= | a core.async channel of the elements, closed after the last one (see below)      |
+| =channel->vec! [ch]=   | drains a channel into a promise of a vector; an error item rejects it                       |
+| =dispose-all! [elements]= | frees every tensor inside a materialised vector                                          |
+
+*Ownership* (inventory 11.10): tensors inside =to-vec!= / =->batches!= / channel results
+belong to the caller — =dispose-all!= when done. =fit-dataset!= / =evaluate-dataset!=
+consume the opaque dataset directly and tfjs disposes each batch after its step.
+
+** The core.async channel
+
+=->channel!= is the house pattern shared with the leveldb-cljs iterators: a =go= loop pulls
+=next!= one element at a time (tf.data is promise-per-element; the buffer only smooths
+bursts), puts each element on the channel, and closes it on =done=. An iterator rejection
+— tfjs's own, or an ex-info thrown by your =map= / =func= / =generator= code, which arrives
+with its message prefixed "Error thrown while iterating through a dataset" and its
+=ex-data= intact (inventory 11b.7) — is put on the channel as the *last* item (test with
+=data/error?=) before it closes; =channel->vec!= turns that into a rejection. Closing the
+channel yourself stops the producer: the element it could not deliver is disposed,
+elements already in the buffer can still be taken (drain them, then =dispose-all!=). A
+parked put re-checks the closed state every =cancel-poll-ms= (100 ms) because core.async
+does not wake parked puts on close.
+
+#+begin_src clojure
+(let [ch (data/->channel! (data/batch ds 32) {:buffer 4})]
+  (go-loop []
+    (when-some [b (<! ch)]
+      (if (data/error? b)
+        (println "failed:" (ex-message b))
+        (do (train-step! (:xs b) (:ys b)) (tf/dispose! b) (recur))))))
+#+end_src
+
+** Training on datasets
+
+=fit-dataset! [m ds & [opts]]= takes a dataset of ={:xs .. :ys ..}= batches; =:epochs=,
+=:batches-per-epoch=, =:callbacks=, =:validation-data= (a dataset or =[xs ys]=),
+=:validation-batches=, =:validation-batch-size=, =:yield-every=, =:initial-epoch=,
+=:class-weight=, =:verbose= 0. tfjs reuses *one* iterator across epochs: without =repeat= a
+second epoch finds it exhausted and stops with a warning ("ran out of data after 0
+batches"), so multi-epoch training uses =(data/repeat ds)= and =:batches-per-epoch=.
+=:batches-per-epoch= is *required* whenever =size= is nil or infinite — the wrapper rejects
+with =:argument-error= instead of letting tfjs hang (inventory 11.17). =evaluate-dataset!
+[m ds & [{:batches n}]]= resolves to the metrics map.
+
+* Backend notes
+
+- *Only =cpu= registers* under Node with pure tfjs (=find-backend "webgl"= is false;
+  =set-backend! "webgl"= rejects with =:backend-error=). =backend= returns nil until the
+  backend is initialised — call =ready!= first, or run any op; the smoke's section 0 does.
+- *Performance* (single runs, this machine, inventory 1.4 and the smoke): 100×100 matmul
+  32 ms, 512×512 matmul ≈0.6 s (≈0.4 GFLOP/s); the seeded XOR MLP, 150 epochs of 4
+  samples, ≈0.45 s; a 32→64→10 MLP over 1024 samples × 3 epochs ≈0.7 s. Fine for small
+  models and pipelines, not for image CNNs.
+- *The banner*: on the first tensor write the CPU backend prints "Hi, looks like you are
+  running TensorFlow.js in Node.js…" through =console.warn=. =prod-mode!= silences it — at
+  a price: production mode also disables tfjs's TensorLike shape-consistency check and its
+  NaN checks (inventory 11.5). The wrapper's own ragged check still runs, so the
+  trade-off is the NaN checks. The library does not enable it by default; the smoke does
+  not either (its section 0 asserts =:prod= is false).
+- *Environment flags*: =env-flag= (=:is-node=, =:prod=, =:debug=, or an exact string) and
+  =env-flags= (every flag, kebab-keyed) are read-only; =debug-mode!= logs every kernel
+  (slow); =disable-deprecation-warnings!= does what it says. =version= gives the seven
+  bundled package versions (=:tfjs "4.22.0"=).
+- *tfjs-node opt-in* (inventory 1.4, 11.1): install =@tensorflow/tfjs-node= in the
+  consumer, =(js/require "@tensorflow/tfjs-node")= *before* requiring
+  =tensorflow-cljs.core= so it registers its =tensorflow= backend (priority 3) into the
+  same tfjs-core instance, then =(core/set-backend! "tensorflow")=. The 4.22.0 prebuilt
+  binary exists for N-API 8; Node 22 installs sometimes create a =napi-v9= directory while
+  the binding lands in =napi-v8= (tfjs issue #8430) — copying the =napi-v8= directory is the
+  reported workaround. Not covered by the tests or the smoke.
+
+* Error handling
+
+Every failure is an =ex-info=; synchronous calls throw it, promise-returning calls reject
+with it (a failing =fit!= never becomes an unhandled rejection because the promise is
+always returned). =util/error-data= gives the map, =util/error-type= the =:type=:
+
+| =:type=                              | when                                                                                                      | extra data |
+|--------------------------------------+-----------------------------------------------------------------------------------------------------------+------------|
+| =:tensorflow-cljs/tf-error=          | tfjs itself threw or rejected                                                                             | =:code= (below), =:name= (the JS constructor name), =:message=, =:cause= (the original error) |
+| =:tensorflow-cljs/argument-error=    | caught by the wrapper *before* tfjs: unknown dtype / registry keyword / layer / hook, ragged data, shape–count mismatch, nil data, a dataset of unknown size without =:batches-per-epoch=, missing =:optimizer= / =:loss= | the offending value, =:allowed= where there is a registry |
+| =:tensorflow-cljs/io-error=          | save / load: missing =model.json= or shard, unreadable files, a graph model given to =load!= (or vice versa), fetch failures | =:path= / =:dir= / =:format= |
+| =:tensorflow-cljs/backend-error=     | =set-backend!= of an unregistered backend                                                                  | =:backend=  |
+
+** Reading tfjs errors: constructor.name, then the message
+
+tfjs-layers defines =ValueError=, =RuntimeError=, =NotImplementedError=, =AttributeError=,
+=IndexError= and =AssertionError=, but sets the prototype without setting =name= (=e.name= is
+always ="Error"=) and does not export the classes from the umbrella (=instanceof= is
+impossible). The only handle is =e.constructor.name=, which =core= reads; tfjs-core's own
+errors are plain =Error= objects whose message is the only structure (inventory 8).
+=util/classify-tf-error= maps that into =:code=:
+
+| =:code=                    | from                                                                                                   | typical trigger |
+|----------------------------+--------------------------------------------------------------------------------------------------------+-----------------|
+| =:value-error=             | constructor =ValueError=                                                                                 | unknown activation / loss / optimizer *string*, first layer without =:input-shape=, "expected … to have shape [null,3] but got array with shape [1,2]", a layers model handed to the graph loader's own parser |
+| =:runtime-error=           | =RuntimeError=                                                                                           | "The model needs to be compiled before being used." (=fit!= on a plain reload — verified live) |
+| =:not-implemented-error= =:attribute-error= =:index-error= | the other layers classes                                                | =output-shape= of a layer used only eagerly (=:attribute-error=) |
+| =:shape-error=             | message mentions shape / rank / dtype / dimension / broadcast, or a "must be int32 tensor" dtype demand | "Error in matMul: inner shapes (2) and (1) … must match" (verified live), "Operands could not be broadcast together", =one-hot= with float indices, a string tensor in a numeric op |
+| =:assertion-error=         | message starts with "Error in <op>"                                                                    | other =util.assert= failures in tfjs-core |
+| =:unknown=                 | everything else                                                                                        | "Tensor is disposed.", "Cannot start training because another fit() call is ongoing.", a =TypeError= from inside tfjs |
+
+=util/error-code= reads it, =util/shape-error?= tests the common case. Messages remain the
+contract for anything finer.
+
+#+begin_src clojure
+(try (tf/mat-mul (tf/tensor [[1 2]]) (tf/tensor [[1 2 3]]))
+     (catch :default e
+       (util/error-type e)        ; => :tensorflow-cljs/tf-error
+       (util/error-code e)        ; => :shape-error
+       (:name (ex-data e))))      ; => "Error"
+
+(-> (models/load! "nope")
+    (p/catch (fn [e] (when (= :tensorflow-cljs/io-error (util/error-type e)) (:path (ex-data e))))))
+#+end_src
+
+An =ex-info= thrown by *your* code inside a callback, a =map= function or a custom loss
+passes through unchanged (so your =ex-data= survives); a plain JS error from your code is
+wrapped like a tfjs error.
+
+* Design decisions
+
+- *One interop namespace, and it is =core=.* The inventory planned a separate =binding=
+  namespace; the directive named =core= as the one tfjs-touching namespace, so the tensor
+  core and the layer / model / io / data bridges live together there. =layers=, =models= and
+  =data= are plain ClojureScript over it, which is what makes "no =^js= anywhere" and "no
+  interop at call sites" checkable by grep.
+- *Tensors are the tfjs objects, opaque.* A record wrapper would force an unwrap on every
+  op argument and make =tidy='s container walk miss tensors; a =->vec= on every op result
+  would cost a copy per call. Opaque values with explicit readers are the cheapest honest
+  contract (inventory 9.2).
+- *Ragged input is rejected by the wrapper* (inventory 2.1 correction). tfjs 4.22 silently
+  mis-shapes =[1 [2 3]]= because its consistency flag defaults to false; the wrapper's
+  =util/ragged?= check costs one walk per creation and turns garbage into an
+  =:argument-error=. It stays on under =prod-mode!= (only tfjs's own checks go).
+- *=tidy= collects tensors itself* and never lets tfjs walk ClojureScript data (inventory
+  11.4): tfjs's =for…in= walk over a persistent map is both slow and semantically wrong
+  (it sees prototype members). The ClojureScript walk handles maps, vectors, sets, seqs,
+  JS arrays and objects, then hands tfjs a plain array; =dispose!= reuses it.
+- *Readers map bool to booleans* — tfjs's =arraySync= gives 1 / 0 for bool tensors; a
+  ClojureScript caller of =(->vec (equal a 2))= expects =true= / =false=. The extra pass runs
+  on bool tensors only (inventory 9.5). complex64 stays interleaved (no complex type;
+  =real= / =imag= are the readers, inventory 11.7).
+- *Registries are data and are validated before tfjs.* Loss / metric / optimizer /
+  activation / initializer keywords are looked up in maps the consumer can read;
+  unknown keywords are =:argument-error= with =:allowed=. tfjs would reject them too, but
+  with a =ValueError= whose class is invisible by name (see below) and, for losses, only
+  the camelCase spelling — the wrapper accepts =:mse= and friends and resolves them itself.
+- *Errors are classified from =constructor.name= and the message* because that is all
+  tfjs gives: the layers error classes do not set =name= and are not exported, tfjs-core
+  throws plain =Error=. The =:code= taxonomy is deliberately coarse; the message stays
+  the contract for finer branching (inventory 8).
+- *The save handler is the library's own node-fs code writing the tfjs-node layout*
+  (=model.json= + =weights.bin=, single shard on save, manifest-order concatenation of any
+  number of shards on load). Pure tfjs has no =file://= handler; registering a global
+  router would mutate tfjs state for every consumer, an explicit handler value would be
+  one more opaque type to explain — a path string that does the obvious thing is the
+  house choice (inventory 4.6, 11.6). Quantized weights are decoded by tfjs on load;
+  writing quantized shards is not offered.
+- *=:include-optimizer= is opt-in* and its consequence (compiled or not after =load!=) is
+  documented rather than papered over: a default save is the smallest file and a
+  reloaded model that only predicts; a training-config save is what you want to resume
+  training (inventory 11.9). The one-scalar leak per such save is tfjs's and is stated.
+- *=predict= / =evaluate= are synchronous with =!= twins.* tfjs runs them synchronously; the
+  promise forms exist so that a call site mixing them with =fit!= reads uniformly and
+  gets rejections instead of throws (inventory 9.3). =evaluate= reads and disposes the
+  scalars tfjs returns because a map of numbers is what a caller wants and leaked scalars
+  are what they would otherwise get (inventory 11.15).
+- *Callback maps are always wrapped in tfjs =CustomCallback= objects* because tfjs
+  crashes on a list that mixes plain objects with instances, and hook maps are the
+  natural ClojureScript form. The fit's =:yield-every= is forwarded into each object
+  because tfjs reads it from the constructor, not from the fit (inventory 11b.2). The
+  =BaseCallback= class is reached through =CustomCallback='s prototype chain because the
+  umbrella does not export it (inventory 11b.1) — a phase-3 test masked that bug by
+  orphaning its promises; it is chained now.
+- *=models/dispose!= also disposes the optimizer.* tfjs's =model.dispose()= leaves the
+  optimizer alone and SGD / Momentum keep plain scalars that =disposeVariables= never
+  sees (inventory 11b.3); a model being disposed will not train again, so freeing its
+  optimizer is the expected default, with =:keep-optimizer= for a shared object.
+- *=fit-dataset!= refuses an unknown / infinite size without =:batches-per-epoch=*
+  (inventory 11.17) instead of letting tfjs run forever or stop after the first epoch.
+- *Graph models are loaded, not managed.* =load-graph!= + =graph-predict= / =graph-execute=
+  cover inference of converter output through the same offline artifacts path; the
+  converter's =registerOp= / =deregisterOp= (custom ops) and =GraphModel.save= are not
+  exposed (inventory 11.12, 11b.6).
+- *The core.async channel is an element stream, not a lazy seq* — blocking on a promise
+  is impossible in JS, so a channel with backpressure, an error as last item and
+  close-to-cancel is the house form (inventory 5.3); =channel->vec!= bridges back to a
+  promise.
+- *Phase-4 leftovers recorded as debt* rather than shipped half-way:
+  - *custom IO handler objects* (={:save fn :load fn}= maps as =save!= / =load!= targets):
+    not offered. The in-memory pair =save-artifacts!= / =load-artifacts!= already gives a
+    consumer the artifacts to store anywhere and load from anywhere, which is what a
+    custom handler would do with one more indirection; revisit only if a consumer needs
+    tfjs's =io.http= *save* path or =weightPathPrefix=-style options on a custom source.
+  - *http save*, =io.copyModel= / =listModels= / =removeModel= (browser storage managers,
+    no-ops under Node), the =io.http= save handler, =weightUrlConverter= and =streamWeights=
+    load options beyond what =load!= forwards as =opts=: not offered.
+  - *tfjs-node as a tested backend* (inventory 11.1): documented opt-in only; no
+    =TFJS_NODE=1= smoke variant ships because the package is not a dependency and the
+    Node 22 =napi-v9= directory issue would make the smoke environment-dependent.
+  - *=GraphModel= extras* — =getIntermediateTensors= / =disposeIntermediateTensors= and
+    =KEEP_INTERMEDIATE_TENSORS=: not exposed (no leak per call was measured).
+  - *Quantized or multi-shard writing* on save: the loader handles both, the saver writes
+    one float32 shard.
+
+* Testing and the live smoke
+
+#+begin_src bash
+npm install
+./run-tests.sh                                          # cljs.test suite: 74 tests / 935 assertions, no network; exit status reflects pass/fail
+npx shadow-cljs watch node-test                         # re-runs the suite on every change (autorun)
+npx shadow-cljs compile smoke && node target/smoke.js   # LIVE smoke: real compute + real files in a temp dir, 9 sections, no network
+TFCLJS_SMOKE_STACK=1 node target/smoke.js               # same, with the JS stack of every failure
+#+end_src
+
+- *=run-tests.sh=* compiles the =:node-test= build with autorun disabled (shadow does not
+  propagate the autorun exit status) and =exec=s =node target/node-test.js= — nothing after
+  that line in the script would run. The suite (=test/tensorflow_cljs/=) runs on the CPU
+  backend in ≈2 s after the compile and touches the disk only through temporary
+  directories it removes. It covers: case translation, =->config=, dtypes, =ragged?=, the
+  error constructors and =classify-tf-error= (=util_test=); creation for every dtype and
+  the argument errors, readers incl. bool / complex64 / string, buffers, variables,
+  =tidy= with nested containers and the 200-tensor timing bound, =dispose!=, memory, every
+  op group with hand-computed values, async ops, image / linalg / losses / signal /
+  sparse / string / fused, optimizers, gradients and =minimize!=, error classification
+  live (=core_test=); every constructor of the catalog, registries and the
+  keyword / map / object forms of initializers, regularizers, constraints, eager and
+  symbolic =apply-layer=, accessors (=layers_test=); sequential and functional models,
+  compile registries and rejections, XOR to 100 %, linear regression, validation
+  histories, callbacks incl. =:on-yield= semantics and the mixed vector, early stopping
+  and =stop-training!=, =evaluate= disposal, save / load round trips through a temp dir
+  with and without =:include-optimizer=, the fabricated two-shard manifest and the
+  missing-file errors, in-memory artifacts and topology JSON, a fabricated graph model
+  (=load-graph!=, predict, execute, the crossed-format errors, disposal), weights,
+  =fit-dataset!= / =evaluate-dataset!= (=models_test=); every data source incl. a CSV file,
+  the combinators, consumers, the core.async channel (order, buffer 1, error as last
+  item, close-to-cancel) and ownership (=data_test=).
+- *REPL*: =npx shadow-cljs watch dev= (terminal 1), =node target/dev.js= (terminal 2),
+  =npx shadow-cljs cljs-repl dev= (terminal 3).
+- =shadow-cljs.edn= is standalone (declares =funcool/promesa= itself; core.async ships with
+  shadow) so =npx shadow-cljs …= only needs Java and =node_modules=; =deps.edn= mirrors the
+  dependencies for consumers. Builds: =:node-test=, =:dev=, =:smoke=.
+
+** The live smoke
+
+=dev/tensorflow_cljs/smoke.cljs= is the phase-4 live verification: the whole library doing
+real compute on the CPU backend and real file I/O under a directory created with
+=mkdtemp= in the OS temp directory (removed at the end). There is no network anywhere.
+Sections run in order and never abort early: each prints =PASS <name> [ms, tensors
+before -> after] — <detail>= or =FAIL <name>: <reason>=, a tally comes last, and the exit
+code is 0 only when every section passed. Total runtime ≈1.6 s.
+
+| # | section                                        | what it proves                                                                                                                                       |
+|---+------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 0 | backend + platform report                      | =ready!= then =backend= is ="cpu"=, webgl absent, tfjs 4.22.0, Node / platform, =:is-node= true and =:prod= false, memory starts at 0 tensors            |
+| 1 | tensor creation + round trip                   | float32 default and the =0.1= trap, =:int32= truncation and 2³¹ wrap, bool → booleans, strings, =:shape=, scalars, =strides=; ragged (two shapes), =:float64=, count mismatch and nil → =:argument-error=; =data!= / =->vec!= |
+| 2 | op algebra + memory                            | hand-computed matmul / reshape / sum / broadcast / equal / topk / cast / int32 division; a mismatched matmul is =:shape-error=; 12 tensors made inside =tidy= leave exactly the one kept, =dispose!= restores the count, a disposed tensor throws |
+| 3 | training                                       | the seeded XOR MLP reaches accuracy 1 in 150 epochs (≈0.45 s), predictions =[0 1 1 0]=; a linear regression y = 3x + 1 converges 100× with a monotone loss curve to w ≈ 3, b ≈ 1 |
+| 4 | save / load                                    | =model.json= + =weights.bin= written, byte count = 4 × params; plain reload predicts bit-identically and is not compiled (=fit!= → =:runtime-error=); =:include-optimizer= reload is compiled, restores metrics and trains; a fabricated two-shard manifest reloads identically; a fabricated graph model predicts and executes; missing dir and crossed formats → =:io-error=; the one-tensor tfjs leak per optimizer save is measured |
+| 5 | callbacks                                      | all seven hooks counted over 3 epochs × 2 batches, logs carry =:loss= / =:acc= as numbers, =:on-yield= fires under a 1 ms interval, a hook map mixed with an early-stopping object, a promise-returning hook is awaited |
+| 6 | early stopping                                 | patience 1 on deliberately flipped validation labels stops a 200-epoch fit after 2; =stop-training!= at epoch index 2 ends after 3 epochs               |
+| 7 | data pipeline                                  | a CSV file → =csv= with a label column → =map= → =shuffle= (seeded) → =batch= → =take= → =->channel!= (2 batches of =[4 2]=) and =->batches!=; =train-on-batch!= on a channel batch; =fit-dataset!= on =(repeat ds)= with =:batches-per-epoch=; unknown size without it → =:argument-error= |
+| 8 | clean memory report                            | every tracked model (with its optimizer) and tensor disposed, =dispose-variables!=: the count returns to the start plus exactly the known tfjs leak from section 4 |
+
+* API reference
+
+One row per public function or constant (op groups share a row). Functions returning a
+promesa promise end in =!= where the asynchrony is tfjs's; purely side-effecting
+synchronous functions also carry =!= (=assign!=, =set-weights!=, =dispose!=, house style).
+Pure helpers (no tfjs objects) are marked *pure*. Every name below exists in =src/= and
+every public name in =src/= appears below (checked by script when this manual was
+written).
+
+** =tensorflow-cljs.core= — consumer surface
+
+*** Predicates and creation
+
+| fn | what |
+|----+------|
+| =tensor?= =variable?= =symbolic?= =layer?= =model?= =sequential-model?= =optimizer?= =dataset?= =callback?= =graph-model?= | predicates on opaque values |
+| =tensor [values & [opts]]= | number / boolean / string / flat or nested vector / typed array ⇒ tensor; opts a dtype keyword or ={:shape :dtype}=; ragged, count mismatch, unknown dtype, nil ⇒ =:argument-error= |
+| =tensor1d= =tensor2d= =tensor3d= =tensor4d= =tensor5d= =tensor6d [values & [opts]]= | rank-checked variants |
+| =scalar [v & [dtype]]= | rank 0 |
+| =zeros= =ones [shape & [dtype]]= / =fill [shape value & [dtype]]= / =zeros-like= =ones-like [x]= | constant tensors |
+| =eye [n & [{:num-columns :batch-shape :dtype}]]= / =linspace [start stop num]= / =range [start stop & [step dtype]]= | sequences |
+| =random-normal= =random-standard-normal= =truncated-normal= =random-uniform [shape & [{:mean :std-dev :minval :maxval :dtype :seed}]]= / =random-uniform-int [shape min max & [seed]]= / =random-gamma [shape alpha & [{:beta :dtype :seed}]]= / =rand [shape f & [dtype]]= / =multinomial [logits n & [{:seed :normalized}]]= | random tensors |
+| =one-hot [indices depth & [{:on-value :off-value :dtype}]]= | int32 indices (a vector is cast) ⇒ one-hot |
+| =complex [re im]= / =real= =imag [x]= | complex64 construction and parts |
+| =variable [init & [{:trainable :name :dtype}]]= / =assign! [v value]= / =clone [x]= | variables and copies |
+| =buffer [shape & [{:dtype :values}]]= / =->buffer [t]= / =buffer-get [b & idx]= / =buffer-set! [b v & idx]= / =buffer->tensor [b]= | mutable TensorBuffer path |
+
+*** Reading, memory, backend
+
+| fn | what |
+|----+------|
+| =shape= =dtype= =rank= =size= =strides= =disposed? [t]= | metadata (=strides= in tfjs's convention) |
+| =->vec= (=->clj=) =[t]= / =->vec! [t]= | nested vectors (bool ⇒ booleans, scalar ⇒ bare value) / promise |
+| =data-sync [t]= / =data! [t]= | flat vector / promise |
+| =get-element [t & idx]= / =bytes! [t]= / =->string [t & [{:verbose}]]= / =print [t & [opts]]= | one element / raw bytes / tfjs rendering |
+| =tidy [f]= / =[name f]= | scoped disposal keeping the tensors of the return value |
+| =keep [t]= / =dispose! [x]= / =dispose-variables! []= | exempt / free a tensor or container / free every variable |
+| =memory []= / =num-tensors []= / =profile! [f]= / =time! [f]= | ={:num-tensors :num-bytes ..}= / count / profiling promises |
+| =backend []= / =ready! []= / =set-backend! [name]= / =find-backend [name]= | backend control (=set-backend!= rejects =:backend-error=) |
+| =env-flag [flag]= / =env-flags []= / =prod-mode! []= / =debug-mode! []= / =disable-deprecation-warnings! []= / =version []= | environment |
+
+*** The op algebra (one fn per tfjs op; docstrings give the argument order)
+
+| group | fns |
+|-------+-----|
+| arithmetic | =add= =add-n= =sub= =mul= =div= =div-no-nan= =floor-div= =mod= =pow= =neg= =abs= =sign= =square= =sqrt= =rsqrt= =reciprocal= =squared-difference= =maximum= =minimum= =atan2= =clip-by-value= =round= =floor= =ceil= |
+| elementwise math | =exp= =expm1= =log= =log1p= =sin= =cos= =tan= =asin= =acos= =atan= =sinh= =cosh= =tanh= =asinh= =acosh= =atanh= =erf= =is-finite= =is-inf= =is-nan= =step= =bitwise-and= |
+| activations | =relu= =relu6= =elu= =selu= =prelu= =leaky-relu= =sigmoid= =log-sigmoid= =softplus= =softmax= =log-softmax= =dropout= |
+| reductions =[x & [axis keep-dims]]= | =sum= =mean= =prod= =max= =min= =arg-max= =arg-min= =all= =any= =log-sum-exp= =euclidean-norm= =norm= =moments= (⇒ ={:mean :variance}=) =cumsum= =cumprod= |
+| comparison / logical | =equal= =not-equal= =greater= =greater-equal= =less= =less-equal= =logical-and= =logical-or= =logical-not= =logical-xor= =where= =where!= |
+| shape / geometry | =reshape= =transpose= =expand-dims= =squeeze= =concat= =stack= =unstack= =split= =slice= =strided-slice= =gather= =gather-nd= =scatter-nd= =tensor-scatter-update= =reverse= =tile= =pad= =mirror-pad= =broadcast-to= =broadcast-args= =batch-to-space-nd= =space-to-batch-nd= =depth-to-space= =boolean-mask!= =ensure-shape= =cast= =meshgrid= =diag= |
+| linear algebra | =mat-mul= (=matmul=) =dot= =outer-product= =einsum= =batch-norm= =linalg-band-part= =linalg-gram-schmidt= =linalg-qr= (⇒ =[q r]=) |
+| convolution / pooling | =conv1d= =conv2d= =conv2d-transpose= =conv3d= =conv3d-transpose= =depthwise-conv2d= =separable-conv2d= =dilation2d= =avg-pool= =max-pool= =avg-pool3d= =max-pool3d= =max-pool-with-argmax= (⇒ ={:result :indexes}=) =pool= =local-response-normalization= =fused-conv2d= =fused-depthwise-conv2d= =fused-mat-mul= (one args map each) |
+| recurrent cells | =basic-lstm-cell= =multi-rnn-cell= |
+| search / sort / sets | =topk= =unique= (⇒ ={:values :indices}=) =search-sorted= =lower-bound= =upper-bound= =in-top-k!= =setdiff1d!= =bincount= =dense-bincount= |
+| segment / sparse / ragged | =unsorted-segment-sum= =sparse-to-dense= =ragged-gather= =ragged-range= =ragged-tensor-to-tensor= =sparse-fill-empty-rows= =sparse-reshape= =sparse-segment-mean= =sparse-segment-sum= |
+| signal / spectral | =fft= =ifft= =rfft= =irfft= =enclosing-power-of-two= =cosine-window= =signal-hamming-window= =signal-hann-window= =signal-frame= =signal-stft= |
+| image | =image-flip-left-right= =image-grayscale-to-rgb= =image-rgb-to-grayscale= =image-resize-bilinear= =image-resize-nearest-neighbor= =image-rotate-with-offset= =image-crop-and-resize= =image-non-max-suppression= =image-non-max-suppression!= =image-non-max-suppression-with-score= =image-non-max-suppression-with-score!= =image-non-max-suppression-padded= =image-non-max-suppression-padded!= =image-threshold= =image-transform= |
+| losses (fns) | =loss-reductions= (the reduction keywords) =losses-absolute-difference= =losses-mean-squared-error= =losses-hinge-loss= =losses-compute-weighted-loss= =losses-cosine-distance= =losses-huber-loss= =losses-log-loss= =losses-sigmoid-cross-entropy= =losses-softmax-cross-entropy= =metric-fn [name]= |
+| string | =string-n-grams= =string-split= =string-to-hash-bucket-fast= =static-regex-replace= |
+| misc | =moving-average= |
+
+*** Custom training loops
+
+| fn | what |
+|----+------|
+| =make-optimizer [ctor-name args]= / =optimizer-class-name [o]= / =optimizer-dispose! [o]= | tf.train constructor by name with positional args (=models/optimizer= is the map form) / ="Adam"= / free its tensors |
+| =minimize! [opt f & [{:return-cost? :var-list}]]= | one step; returns the cost as a number |
+| =compute-gradients [opt f & [var-list]]= / =apply-gradients! [opt grads]= | ={:value :grads {name tensor}}= / apply a name ⇒ gradient map |
+| =grad [f]= / =grads [f]= / =value-and-grad [f]= / =variable-grads [f & [var-list]]= / =custom-grad [f]= | gradient functions (=value-and-grad= ⇒ ={:value :grad}=) |
+
+** =tensorflow-cljs.core= — bridges used by =layers= / =models= / =data=
+
+Already-translated arguments; consumers use the sibling namespaces instead.
+
+| fn | what |
+|----+------|
+| =make-layer [ctor-name config]= =make-input [config]= =make-initializer= =make-regularizer= =make-constraint [name args]= | constructors by tfjs name |
+| =layer-apply= =layer-weights= =layer-set-weights!= =layer-count-params= =layer-config= =layer-name= =layer-class-name= =layer-trainable?= =layer-set-trainable!= =layer-built?= =layer-build!= =layer-output-shape= =layer-compute-output-shape= =layer-dispose!= =layer-reset-states!= =layer-batch-input-shape= =layer-input= =layer-output= | layer methods |
+| =symbolic-name= =symbolic-shape= =symbolic-dtype [s]= | symbolic tensor readers |
+| =make-sequential [layers name]= =make-model [{:inputs :outputs :name}]= =model-add!= =model-pop!= =model-compile! [m config]= | construction / compile |
+| =callback-hooks= =make-callback [hooks & [yield-every]]= =early-stopping [config]= | the hook-key table, CustomCallback and EarlyStopping objects |
+| =model-fit!= =model-fit-dataset!= =model-train-on-batch!= =model-predict= =model-predict-on-batch= =model-evaluate= =model-evaluate-dataset!= =model-execute= | training / inference |
+| =model-metrics-names= =model-summary= =model-layers= =model-get-layer= =model-name= =model-weights= =model-set-weights!= =model-count-params= =model-compiled?= =model-optimizer= =model-stop-training!= =model-stop-training?= =model-reset-stop-training!= =model-dispose! [m & [keep-optimizer?]]= =model-inputs= =model-outputs= =model-input-names= =model-output-names= =model-to-json= =model-from-json!= =model-user-metadata= =model-set-user-metadata!= | introspection |
+| =model-artifacts! [m opts]= =artifacts-info= =artifacts-weight-specs= =artifacts-format [a]= =load-artifacts! [a]= =save-artifacts-to-dir! [a dir]= =read-artifacts-from-dir! [dir]= =load-from-url! [url opts]= | io: in-memory artifacts and the node-fs handler |
+| =load-graph-artifacts! [a]= =load-graph-from-url! [url opts]= =graph-predict [g x opts]= =graph-execute= =graph-execute! [g x names]= =graph-inputs= =graph-outputs= =graph-input-names= =graph-output-names= =graph-dispose! [g]= | graph models |
+| =dataset-array= =dataset-generator= =dataset-func= =dataset-csv [source config]= =dataset-zip= =dataset-batch= =dataset-map= =dataset-map-async= =dataset-filter= =dataset-shuffle= =dataset-repeat= =dataset-take= =dataset-skip= =dataset-prefetch= =dataset-concatenate= =dataset-size= =dataset-to-vec!= =dataset-for-each!= =dataset-iterator!= =iterator-next!= =csv-column-names!= =dataset-max-buffer-size= | tf.data |
+
+** =tensorflow-cljs.layers=
+
+| fn | what |
+|----+------|
+| =activations= =initializers= =regularizers= =constraints= =layer-aliases= =layer-constructors= | the registries (kebab keyword ⇒ tfjs identifier), *pure* data |
+| =initializer= =regularizer= =constraint [type & [args]]= | opaque objects (=:random-normal {:mean :stddev :seed}=, =:l2 {:l2 0.01}=, =:max-norm {:max-value}= …) |
+| =prepare-config [config]= | *pure*: validates activations, builds initializer / regularizer / constraint objects from keywords and maps |
+| =layer [type & [config]]= | generic constructor for any key of =layer-constructors= |
+| =input-layer= =elu= =relu= =leaky-relu= =prelu= =softmax= =thresholded-relu= =conv1d= =conv2d= =conv2d-transpose= =conv3d= =conv3d-transpose= =separable-conv2d= =depthwise-conv2d= =cropping2d= =up-sampling2d= =activation= =dense= =dropout= =spatial-dropout1d= =flatten= =repeat-vector= =reshape= =permute= =embedding= =masking= =add= =average= =concatenate= =maximum= =minimum= =multiply= =dot= =batch-normalization= =layer-normalization= =zero-padding2d= =average-pooling1d= =average-pooling2d= =average-pooling3d= =max-pooling1d= =max-pooling2d= =max-pooling3d= =global-average-pooling1d= =global-average-pooling2d= =global-max-pooling1d= =global-max-pooling2d= =simple-rnn= =gru= =lstm= =simple-rnn-cell= =gru-cell= =lstm-cell= =conv-lstm2d= =conv-lstm2d-cell= =rnn= =stacked-rnn-cells= =bidirectional= =time-distributed= =gaussian-noise= =gaussian-dropout= =alpha-dropout= =rescaling= =center-crop= =resizing= =category-encoding= =random-width= | the catalog: =[& [config]]= ⇒ opaque layer (aliases through =layer= / =layer-aliases=) |
+| =input [config]= / =apply-layer [layer inputs & [kwargs]]= | symbolic input / apply (symbolic or eager) |
+| =layer?= =symbolic?= =weights= =set-weights!= =count-params= =config= =layer-name= =class-name= =trainable?= =set-trainable!= =built?= =build!= =output-shape= =compute-output-shape= =batch-input-shape= =dispose!= =reset-states!= =symbolic-shape= =symbolic-name= | accessors |
+
+** =tensorflow-cljs.models=
+
+| fn | what |
+|----+------|
+| =losses= =metrics= =optimizers= =optimizer-args= | compile registries, *pure* data |
+| =optimizer [type & [opts]]= / =dispose-optimizer! [o]= | opaque optimizer with hyper-parameters (=:adam {:learning-rate 0.01}=) / free it |
+| =sequential [& [layers opts]]= (=make-sequential=) / =add-layer!= / =pop-layer!= / =model [{:inputs :outputs :name}]= (=make-model=) | construction |
+| =compile-model! [m {:optimizer :loss :metrics}]= (=compile!=) | sync; registry keywords, maps, fns, per-output vectors / maps |
+| =fit! [m x y & [opts]]= / =fit-dataset! [m ds & [opts]]= / =train-on-batch! [m x y]= | training promises ⇒ ={:epoch :history :params}= / loss |
+| =predict= =predict! [m x & [opts]]= / =predict-on-batch= =predict-on-batch! [m x]= / =evaluate= =evaluate! [m x y & [opts]]= / =evaluate-dataset! [m ds & [opts]]= / =execute [m x output-names]= | inference: sync and promise twins |
+| =callback [hooks & [{:yield-every}]]= / =early-stopping [& [opts]]= / =stop-training! [m]= | callback objects and the stop flag |
+| =model?= =sequential?= =model-name= =layers= =get-layer= =weights= =set-weights!= =count-params= =metrics-names= =compiled?= =inputs= =outputs= =input-names= =output-names= =summary= =summary-lines= =print-summary= =dispose! [m & [{:keep-optimizer}]]= =user-metadata= =set-user-metadata!= | introspection / weights / disposal |
+| =to-json [m]= / =model-from-json! [topology]= | Keras topology round trip (fresh weights) |
+| =save-artifacts! [m & [opts]]= / =load-artifacts! [a]= / =artifacts-info [a]= / =weight-specs [a]= | in-memory artifacts |
+| =save! [m path & [{:include-optimizer :trainable-only}]]= / =load! [path & [opts]]= | node-fs handler (=model.json= + =weights.bin=, shards concatenated on load); http(s) load |
+| =load-graph! [path & [opts]]= =graph-model?= =graph-predict= =graph-predict! [g x & [opts]]= =graph-execute= =graph-execute! [g x names]= =graph-inputs= =graph-outputs= =graph-input-names= =graph-output-names= =graph-dispose! [g]= | inference-only graph models |
+
+** =tensorflow-cljs.data=
+
+| fn | what |
+|----+------|
+| =dataset? [x]= / =from-vec [items]= (=array=) / =generator [f]= / =func [f]= / =csv [source & [config]]= / =zip [container]= | sources |
+| =batch [ds n & [small-last?]]= =map [ds f]= =map! [ds f]= =filter [ds pred]= =shuffle [ds n & [opts]]= =repeat [ds & [count]]= =take= =skip= =prefetch [ds n]= =concatenate [ds other]= | combinators (pure, new opaque dataset) |
+| =size [ds]= / =max-buffer-size []= | static size (number / nil / =##Inf=) / 10000 |
+| =to-vec! [ds]= / =for-each! [ds f]= / =iterator! [ds]= / =next! [it]= / =->batches! [ds n]= / =column-names! [ds]= | promise consumers |
+| =->channel! [ds & [{:buffer}]]= / =channel->vec! [ch]= / =error? [x]= / =default-channel-buffer= / =cancel-poll-ms= | core.async channel, its drain, the error-item predicate, the constants |
+| =dispose-all! [elements]= | frees every tensor inside materialised elements |
+
+** =tensorflow-cljs.util= (all *pure*)
+
+| fn | what |
+|----+------|
+| =kebab->camel [k]= / =camel->kebab [k]= / =transform-keys [f x]= / =[f passthrough x]= / =->kebab-keys [x]= | key case translation (snake_case history keys included) |
+| =config-passthrough-keys= / =enum-exceptions= / =enum-value [v]= / =config-value [v]= / =->config [m]= | config translation: pass-through subtrees, the =:gelu-new= exception, keyword enums, the full map |
+| =dtypes= / =dtype->str [dt]= / =str->dtype [s]= | the five dtypes (=:argument-error= otherwise) |
+| =shape? [x]= / =size-of-shape [shape]= / =infer-shape [x]= / =ragged? [x & [shape]]= | shape helpers and the ragged check |
+| =error-types= / =classify-tf-error [name message]= / =tf-error= =argument-error= =io-error= =backend-error [message & [data]]= | the taxonomy and the ex-info constructors |
+| =error-data [e]= / =error-type [e]= / =error-code [e]= / =shape-error? [e]= | reading a tensorflow-cljs error (nil for anything else) |

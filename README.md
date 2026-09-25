@@ -19,12 +19,34 @@ is `@tensorflow/tfjs` itself.
 | 1 | API inventory (`docs/tensorflow-api-inventory.org`) | done |
 | 2 | `core` (the ONE interop namespace): tensor creation, data access, memory (tidy/dispose), the whole op algebra (§2.2 census incl. image / linalg / losses / signal / sparse / string / fused), backend control, optimizers + gradients | done |
 | 3 | `layers` (66 constructors + 10 aliases, registries as data) + `models` (sequential / functional, compile / fit / predict / evaluate, callbacks, early stopping, tf.data training, save / load with the library's node-fs handler, in-memory artifacts, topology JSON) + `data` (array / generator / func / csv / zip sources, combinators, promise consumers) | done |
-| 4 | `io` extras (http handler options, graph models), core.async channel over datasets | planned |
-| 5 | live smoke (`dev/`): end-to-end train + save + reload on the CPU backend, perf baseline | planned |
-| 6 | full documentation | planned |
+| 4 | leftovers: `models/load-graph!` + `graph-*` (inference-only converter output through the same offline artifacts path), `data/->channel!` (core.async channel over any dataset, error as last item, close-to-cancel) + `channel->vec!`; fixes found by the smoke: `BaseCallback` reached through the prototype chain (the umbrella does not export it), `:on-yield` interval forwarded to tfjs's callback constructor, `models/dispose!` also frees the optimizer's kept scalars; inventory §11b records the corrections | done |
+| 5 | live smoke (`dev/tensorflow_cljs/smoke.cljs`, `:smoke` build): real compute on the CPU backend + real files in a temp dir, 9 PASS/FAIL sections 0–8 with per-section tensor accounting, ≈1.6 s, no network | done |
+| 6 | user manual (`docs/tensorflow-cljs.org`, 13 chapters + API index) + this README | done |
 
-`./run-tests.sh` — 72 tests / 892 assertions (phases 0–3), no network, ≈2 s of
-test time on the CPU backend (XOR trains to 100 % inside the suite).
+`./run-tests.sh` — 74 tests / 935 assertions, no network, ≈2 s of test time on the CPU
+backend (XOR trains to 100 % inside the suite). `npx shadow-cljs compile smoke && node
+target/smoke.js` — the live smoke, 9/9 sections.
+
+Recorded as debt (manual, "Design decisions"): custom IO handler objects (the
+in-memory `save-artifacts!` / `load-artifacts!` pair covers the use), http *save*,
+tfjs-node as a tested backend, `GraphModel` intermediate-tensor extras, quantized /
+multi-shard *writing*.
+
+## Documentation
+
+- [`docs/tensorflow-cljs.org`](docs/tensorflow-cljs.org) — the user manual: install and
+  quick start, tensors (creation, the dtype table and its traps, opaque values,
+  readers), the op algebra (conventions, how to read the census, examples, custom
+  training loops), memory (`tidy` / `dispose!` / `memory`, what is yours to free), the
+  layers catalog and config translation, models (compile registries, `fit!` options,
+  callback maps and `:on-yield` semantics, early stopping, sync / promise twins, save /
+  load with `:include-optimizer` and sharding, graph models), data pipelines and the
+  core.async channel, backend notes, error handling, design decisions with the phase-4
+  debt, testing and the live smoke, and a per-namespace API index.
+- [`docs/tensorflow-api-inventory.org`](docs/tensorflow-api-inventory.org) — the research
+  the library is built on: package census, op / layer / model / data / io catalogs, error
+  taxonomy, pitfalls, the numbered uncertainties with the house position on each, and
+  the phase-2/3/4 corrections (§11b) found live.
 
 ## Hard style rules (non-negotiable)
 
@@ -77,14 +99,16 @@ libtensorflow kernels, N-API 8 prebuilt binary for linux-x64 exists for
 (tf/->vec (tf/mat-mul a (tf/tensor [[5 6] [7 8]]))) ; => [[19 22] [43 50]]
 (tf/->vec (tf/add a 1))                            ; broadcasting => [[2 3] [4 5]]
 (tf/->vec (tf/equal a 2))                          ; bool => [[false true] [false false]]
+(tf/->vec (tf/tensor [1.9 -2.1] :int32))           ; => [1 -2]
 (tf/tidy (fn [] {:s (tf/sum (tf/square a))}))      ; only the returned tensors survive
 
-;; models
+;; models (the seeded XOR of the suite and the smoke: 100 % in 150 epochs, ≈0.5 s)
 (def xs (tf/tensor [[0 0] [0 1] [1 0] [1 1]]))
 (def ys (tf/tensor [[0] [1] [1] [0]]))
 
 (def m (models/sequential
-        [(layers/dense {:units 8 :activation :tanh :input-shape [2]})
+        [(layers/dense {:units 8 :activation :tanh :input-shape [2]
+                        :kernel-initializer {:type :glorot-uniform :seed 7}})
          (layers/dense {:units 1 :activation :sigmoid})]))
 
 (models/compile-model! m {:optimizer {:type :adam :learning-rate 0.1}
@@ -93,17 +117,27 @@ libtensorflow kernels, N-API 8 prebuilt binary for linux-x64 exists for
 
 (p/let [history (models/fit! m xs ys {:epochs 150 :batch-size 4 :yield-every :never
                                       :callbacks {:on-epoch-end (fn [epoch logs] nil)}})
-        _       (models/save! m "/tmp/xor-model")   ; model.json + weights.bin
-        m2      (models/load! "/tmp/xor-model")]
-  (println (last (get-in history [:history :loss])))
-  (println (models/evaluate m2 xs ys))              ; => {:loss 0.0.. :acc 1}
-  (println (tf/->vec (models/predict m2 xs))))
+        _       (models/save! m "models/xor")                          ; model.json + weights.bin
+        _       (models/save! m "models/xor-opt" {:include-optimizer true})
+        m2      (models/load! "models/xor")                            ; predicts identically, NOT compiled
+        m3      (models/load! "models/xor-opt")]                       ; compiled: fit! continues training
+  (println (last (get-in history [:history :loss])))                  ; ≈ 0.0007
+  (println (models/evaluate m xs ys))                                 ; => {:loss 0.0007 :acc 1}
+  (println (tf/->vec (models/predict m2 xs)))
+  (models/dispose! m2))
 
-;; tf.data
-(def ds (-> (data/from-vec [{:xs [0 0] :ys [0]} {:xs [0 1] :ys [1]}])
-            (data/shuffle 2 {:seed "x"})
-            (data/batch 2)))
-(models/fit-dataset! m ds {:epochs 2})
+;; tf.data: a CSV file -> batches -> training, or a core.async channel
+(def ds (-> (data/csv "data/xor.csv" {:column-configs {"label" {:is-label true}}})
+            (data/map (fn [{:keys [xs ys]}] {:xs [(:x1 xs) (:x2 xs)] :ys [(:label ys)]}))
+            (data/shuffle 8 {:seed "x"})
+            (data/batch 4)))
+(models/fit-dataset! m (data/repeat ds) {:epochs 2 :batches-per-epoch 2})
+(p/let [batches (data/channel->vec! (data/->channel! (data/take ds 2)))]
+  (tf/shape (:xs (first batches))))                                    ; => [4 2]
+
+;; a converter-exported graph model (inference only)
+(p/let [g (models/load-graph! "models/mobilenet")]
+  (models/graph-predict g (tf/zeros [1 224 224 3])))
 ```
 
 ## Errors
@@ -128,11 +162,21 @@ shard, fetch failures), `:backend-error` (`set-backend!`).
 - Only `tidy`, `dispose!` and `models/dispose!` free memory; `evaluate`
   reads and disposes its scalars, `predict` leaves its output to you.
 - `save!` without `{:include-optimizer true}` does not store the training
-  config: the loaded model must be compiled again.
+  config: the loaded model must be compiled again. With it, tfjs leaks one int32
+  scalar per save (inventory §11b.4).
+- `:on-yield` fires only for a numeric / `:auto` `:yield-every` (debounced by wall
+  time); `:epoch` / `:batch` never call it and `:never` + `:on-yield` is rejected by
+  tfjs (§11b.2).
+- `fit-dataset!` reuses one iterator across epochs: use `(data/repeat ds)` with
+  `:batches-per-epoch` for more than one epoch (§11b.5).
+- `models/dispose!` also frees the optimizer (SGD / Momentum keep plain scalars that
+  `dispose-variables!` does not see, §11b.3); pass `{:keep-optimizer true}` for a
+  shared optimizer object.
 
 ## Development
 
 ```
-./run-tests.sh                                  # exec's node at the end — never chain it mid-command
-npx shadow-cljs watch dev && node target/dev.js # REPL runtime
+./run-tests.sh                                          # exec's node at the end — never chain it mid-command
+npx shadow-cljs compile smoke && node target/smoke.js   # live smoke (TFCLJS_SMOKE_STACK=1 for JS stacks on failures)
+npx shadow-cljs watch dev && node target/dev.js         # REPL runtime
 ```

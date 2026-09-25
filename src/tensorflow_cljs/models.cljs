@@ -164,8 +164,9 @@
    progress bar), :callbacks {:on-epoch-end (fn [epoch logs]) ..} or a
    vector of such maps and / or `early-stopping` values, :class-weight
    {class weight}, :sample-weight t, :initial-epoch, :steps-per-epoch,
-   :yield-every :auto|:batch|:epoch|:never|ms. A second fit! on a model
-   while one runs rejects (tfjs guard)."
+   :yield-every :auto|:batch|:epoch|:never|ms (also decides when the
+   :on-yield hook of the callback maps fires; :auto = every 125 ms of wall
+   time). A second fit! on a model while one runs rejects (tfjs guard)."
   ([model x y] (fit! model x y nil))
   ([model x y opts]
    (core/model-fit! model x y (merge {:verbose 0} opts))))
@@ -242,9 +243,13 @@
 
 (defn callback
   "Opaque callback from a hook map {:on-epoch-end (fn [epoch logs]) ..}
-   (fit! accepts the map directly; use this to mix with `early-stopping`)."
-  [hooks]
-  (core/make-callback hooks))
+   (fit! accepts the map directly and wraps it itself; use this only when
+   you need the object). opts {:yield-every :auto|:batch|:epoch|:never|ms}
+   sets when :on-yield fires for THIS object (a tfjs constructor argument:
+   hook maps passed to fit! inherit the fit's :yield-every, objects built
+   here do not)."
+  ([hooks] (callback hooks nil))
+  ([hooks {:keys [yield-every]}] (core/make-callback hooks yield-every)))
 
 (defn- monitor-name [k] (if (keyword? k) (str/replace (name k) "-" "_") k))
 
@@ -287,7 +292,19 @@
   ([model opts] (str/join "\n" (core/model-summary model (or opts {})))))
 (defn summary-lines "The summary as a vector of lines." ([model] (summary-lines model nil)) ([model opts] (core/model-summary model (or opts {}))))
 (defn print-summary "Prints `summary`; returns nil." [model] (println (summary model)))
-(defn dispose! "Frees the model's weights; returns {:ref-count-after-dispose n :num-disposed-variables n}." [model] (core/model-dispose! model))
+(defn dispose!
+  "Frees the model's weights AND the optimizer attached by compile-model!
+   (tfjs's own dispose leaves the optimizer's kept scalars behind: SGD's
+   learning rate, Momentum's momentum); opts {:keep-optimizer true} when
+   the optimizer object is shared with another model. Returns
+   {:ref-count-after-dispose n :num-disposed-variables n}."
+  ([model] (core/model-dispose! model false))
+  ([model {:keys [keep-optimizer]}] (core/model-dispose! model (boolean keep-optimizer))))
+
+(defn dispose-optimizer!
+  "Frees an opaque optimizer's tensors (see `optimizer`); returns nil."
+  [o]
+  (core/optimizer-dispose! o))
 (defn user-metadata "The metadata map attached with set-user-metadata! (string keys), or nil." [model] (core/model-user-metadata model))
 (defn set-user-metadata! "Attaches a JSON-able map saved with the model; returns the model." [model m] (core/model-set-user-metadata! model m))
 
@@ -347,3 +364,54 @@
      (core/load-from-url! path opts)
      (p/let [artifacts (core/read-artifacts-from-dir! path)]
        (core/load-artifacts! artifacts)))))
+
+;; ---------------------------------------------------------------------------
+;; Graph models (tfjs-converter output, inventory §4.7): inference only
+;; ---------------------------------------------------------------------------
+
+(defn load-graph!
+  "Promise of an opaque GRAPH model (tensorflowjs_converter output: a
+   model.json with format \"graph-model\" + weight shards) from a directory /
+   model.json path / \"file://\" URL, or an http(s) URL (opts {:from-tf-hub
+   :weight-path-prefix ..}). Graph models only infer: `graph-predict`,
+   `graph-execute`; they cannot be compiled or trained. Loading a layers
+   model here (or a graph model with `load!`) rejects with
+   :tensorflow-cljs/io-error naming the right function."
+  ([path] (load-graph! path nil))
+  ([path opts]
+   (if (re-find #"^https?://" path)
+     (core/load-graph-from-url! path opts)
+     (p/let [artifacts (core/read-artifacts-from-dir! path)]
+       (core/load-graph-artifacts! artifacts)))))
+
+(def graph-model? "True for an opaque graph model." core/graph-model?)
+
+(defn graph-predict
+  "Opaque output tensor (vector for multi-output graphs) of a graph model
+   for `x`: a tensor, a vector of tensors in `graph-input-names` order, or a
+   map keyed by input name; opts {:batch-size}. Synchronous."
+  ([model x] (graph-predict model x nil))
+  ([model x opts] (core/graph-predict model x opts)))
+
+(defn graph-predict!
+  "Promise form of `graph-predict`."
+  ([model x] (graph-predict! model x nil))
+  ([model x opts] (p/do (graph-predict model x opts))))
+
+(defn graph-execute
+  "Tensor (one name) or vector of tensors of the intermediate graph nodes
+   named in `output-names` (vector of node-name strings) for `x`."
+  [model x output-names]
+  (core/graph-execute model x output-names))
+
+(defn graph-execute!
+  "Promise form of `graph-execute` (executeAsync) — required for graphs with
+   control-flow or dynamic-shape ops."
+  [model x output-names]
+  (core/graph-execute! model x output-names))
+
+(defn graph-inputs "Vector of {:name :shape :dtype} of the input nodes (-1 = unknown dim)." [model] (core/graph-inputs model))
+(defn graph-outputs "Vector of {:name :shape :dtype} of the output nodes." [model] (core/graph-outputs model))
+(defn graph-input-names "Vector of input node names." [model] (core/graph-input-names model))
+(defn graph-output-names "Vector of output node names." [model] (core/graph-output-names model))
+(defn graph-dispose! "Frees the graph model's weights; returns nil." [model] (core/graph-dispose! model))

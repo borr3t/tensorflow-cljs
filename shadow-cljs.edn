@@ -26,4 +26,13 @@
   :dev {:target :node-script
         :main tensorflow-cljs.dev/main
         :output-to "target/dev.js"
-        :devtools {:enabled true}}}}
+        :devtools {:enabled true}}
+
+  ;; Phase 4 LIVE smoke: real compute on the CPU backend + real files under
+  ;; a fresh temp dir (save / load, csv, a fabricated 2-shard manifest and a
+  ;; fabricated graph model); no network. Numbered PASS/FAIL sections,
+  ;; tally, exit code.
+  ;;   npx shadow-cljs compile smoke && node target/smoke.js
+  :smoke {:target :node-script
+          :main tensorflow-cljs.smoke/main
+          :output-to "target/smoke.js"}}}
