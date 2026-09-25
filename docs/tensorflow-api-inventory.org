@@ -162,7 +162,7 @@ House position: *start with pure =@tensorflow/tfjs= (CPU backend)*. Verified loc
 | =buffer=                  | =(shape, dtype?, values?)= → =TensorBuffer= (=set=, =get=, =toTensor=)  | float32       | [DTS] |
 | =clone=                   | =(x)=                                                             |               | [DTS] |
 | =tensor(null)= / non-array | throws "values passed to tensor(values) must be a number/boolean/string or an array of numbers/booleans/strings, or a TypedArray" | | [LIVE] |
-| ragged input =tensor([1,[2,3]])= | throws (shape consistency check; disabled in PROD mode — uncertainty 11.5) | | [LIVE][SRC flags] |
+| ragged input =tensor([1,[2,3]])= | *CORRECTED (phase 2)*: does NOT throw — =TENSORLIKE_CHECK_SHAPE_CONSISTENCY= defaults to =env().getBool('DEBUG')= i.e. false [SRC flags.js:55], so =[1,[2,3]]= becomes shape =[2]= data =[1,2]= and =[[1,2],[3,4,5],[6]]= shape =[3,2]= [LIVE phase 2]. The phase-1 probe ran under debug flags. House: =core/tensor= rejects ragged data itself (=util/ragged?= → =:argument-error=). | | [LIVE][SRC flags] |
 
 ** 2.2 The op algebra — full census
 Counted from =tfjs-core/dist/ops/ops.d.ts= [DTS]:
@@ -223,7 +223,7 @@ Return-shape conventions the wrapper must map [DTS][LIVE]:
 [DTS tensor.d.ts]
 | Member                | Kind  | Notes |
 |-----------------------+-------+-------|
-| =shape= =size= =dtype= =rank= =strides= =id= | props | read-only; =shape= is a plain JS array |
+| =shape= =size= =dtype= =rank= =strides= =id= | props | read-only; =shape= is a plain JS array; =strides= has rank-1 entries (the trailing 1 is omitted: shape =[2,3,4]= → =[12,4]=) [LIVE phase 2] |
 | =isDisposed= =kept= =scopeId= | props | |
 | =data()= → =Promise<TypedArray|string[]>= | async | float32 → Float32Array, int32 → Int32Array, bool → Uint8Array (0/1), string → string[], complex64 → Float32Array interleaved =[re, im, re, im]= |
 | =dataSync()=             | sync  | same, blocking (on CPU it is a plain read) |
@@ -283,7 +283,11 @@ numbers / booleans / strings; keywords must not reach tfjs), typed arrays → CL
 becomes a 10⁶-element vector — expensive but correct; uncertainty 11.8).
 
 * 3. Layers census (tfjs-layers)
-** 3.1 Layer constructors (72, =tf.layers.*=)
+** 3.1 Layer constructors (=tf.layers.*=: 66 distinct + 10 aliases — corrected in phase 2 from "72")
+*Phase 2 correction:* =Object.keys(tf.layers)= has 80 entries [LIVE]: 66 distinct
+constructors (the groups below), 10 alias exports (=avgPool1d/2d/3d=, =avgPooling1d/2d/3d=,
+=maxPool1d/2d=, =globalMaxPool1d/2d=) and the four non-constructors =Layer=, =RNN=, =RNNCell=,
+=input=. tensorflow-cljs.layers/layer-constructors has all 76 callable names.
 [DTS exports_layers.d.ts] Every constructor takes ONE args object (kebab map in the
 wrapper) and returns a =Layer=. Base =LayerArgs= (all optional): =inputShape=,
 =batchInputShape=, =batchSize=, =dtype=, =name=, =trainable=, =weights: Tensor[]=, =inputDType=.
@@ -312,7 +316,9 @@ Not present in 4.22 (for expectation management): =multiHeadAttention=, =attenti
 =getWeights(trainableOnly?)= → =Tensor[]=, =setWeights(Tensor[])=, =countParams()=,
 =getConfig()=, =computeOutputShape(shape)=, =build(shape)=, =dispose()=, props =name=,
 =trainable=, =built=, =weights= / =trainableWeights= / =nonTrainableWeights= (=LayerVariable[]=),
-=inputSpec=, =batchInputShape=, =dtype=, =outputShape=, =input= / =output= (symbolic),
+=inputSpec=, =batchInputShape=, =dtype=, =outputShape= (throws =AttributeError= "has never
+been called" for a layer used only eagerly — it needs a graph node [LIVE phase 2]),
+=input= / =output= (symbolic),
 =getClassName()= ("Dense", …), =resetStates()= (RNN), =stateful=.
 
 ** 3.3 Registries
@@ -381,12 +387,12 @@ number[]>=.
 ** 4.5 predict / evaluate
 | Call                                  | Kind  | Returns |
 |---------------------------------------+-------+---------|
-| =predict(x, {batchSize?, verbose?})=    | sync  | tensor or tensor[] (float32 even for int32 input [LIVE]) ; shape errors are =ValueError= "Error when checking : expected dense_Dense3_input to have shape [null,3] but got array with shape [1,2]." |
+| =predict(x, {batchSize?, verbose?})=    | sync  | tensor or tensor[] (float32 even for int32 input [LIVE]) ; shape errors are =ValueError= "Error when checking : expected dense_Dense3_input to have shape [null,3] but got array with shape [1,2]." *Phase 2:* unlike =fit=, =predict= does NOT accept a ={inputName: tensor}= map (=ValueError= "Expected to see 2 Tensor(s), but instead got 0") — multi-input models take a tensor array [LIVE phase 2] |
 | =predictOnBatch(x)=                     | sync  | tensor or tensor[] |
 | =evaluate(x, y, {batchSize?, verbose?, sampleWeight?, steps?})= | sync | =Scalar= or =Scalar[]= in =metricsNames= order (tensors, must be read + disposed) [LIVE] |
 | =evaluateDataset(dataset, {batches?, verbose?})= | async | =Promise<Scalar | Scalar[]>= |
 | =fitDataset(dataset, {epochs, batchesPerEpoch?, callbacks?, validationData?, validationBatches?, validationBatchSize?, yieldEvery?, initialEpoch?, classWeight?, verbose?})= | async | =Promise<History>=; dataset elements must be ={xs, ys}= (or =[xs, ys]=) batches [LIVE] |
-| =execute(inputs, outputs: names)=       | sync  | intermediate layer outputs by name |
+| =execute(inputs, outputs: names)=       | sync  | intermediate outputs by *SymbolicTensor* name (="concatenate_Concatenate1/concatenate_Concatenate1"=), not layer name — passing a layer name throws =ValueError "Cannot find SymbolicTensors for output name(s)"= [LIVE phase 2]; the wrapper resolves layer names to =layer.getOutputAt(0).name= |
 | =summary()=                             | sync  | prints via =console.log= unless =printFn= given — the wrapper captures lines into a string [LIVE 9–13 lines] |
 | =getLayer(name)= / =getLayer(undefined, index)= / =layers= / =inputs= / =outputs= / =inputNames= / =outputNames= | sync | =getLayer= by index requires the 2-arg form =(undefined, i)= [LIVE] |
 | =getWeights(trainableOnly?)= / =setWeights(tensors)= / =countParams()= / =trainableWeights= | sync | weights are float32 tensors in layer order (kernel, bias, …) |
@@ -415,7 +421,10 @@ number[]>=.
   =generatedBy= ("TensorFlow.js v4.22.0"), =convertedBy= (null), =weightSpecs=
   (=[{name "dense_Dense3/kernel", shape [3 2], dtype "float32", group?, quantization?}]=),
   =weightData= (one =ArrayBuffer=, concatenated in =weightSpecs= order; 32 bytes for a 3→2
-  dense), =trainingConfig= (present after =compile=: ={loss, metrics, optimizer_config…}=),
+  dense), =trainingConfig= (*phase 2 correction:* present only when =save= is called with
+  ={includeOptimizer: true}= on a compiled model — the default save omits it, and the loaded
+  model is then NOT compiled (=optimizer= undefined, =metricsNames= undefined) [LIVE phase 2];
+  with it, the loaded model is compiled and =fit= works without =compile=, resolving 11.9),
   =userDefinedMetadata=, =signature=, =modelInitializer=.
 - The on-disk layout tfjs-node writes (and Keras/tfjs converters produce) is
   =model.json= = =ModelJSON= ={modelTopology, format, generatedBy, convertedBy,
@@ -501,8 +510,14 @@ Uncertainty 11.10: element conversion cost and tensor ownership across =map=.
   =History= (installed automatically; returned by =fit=), =Callback= (adds =model=),
   =EarlyStopping= via =tf.callbacks.earlyStopping({monitor 'val_loss', minDelta 0,
   patience 0, verbose 0, mode 'auto'|'min'|'max', baseline, restoreBestWeights})=
-  (accepted inside =callbacks: [...]= [LIVE]). =registerCallbackConstructor(verbosity,
-  ctor)= adds global callbacks per verbosity level.
+  (accepted inside =callbacks: [...]= [LIVE]). *Phase 2 correction:* a =callbacks= array
+  may not MIX plain =CustomCallbackArgs= objects with =BaseCallback= instances
+  (=EarlyStopping=): =standardizeCallbacks= only wraps plain objects when the first element
+  is not a =BaseCallback=, so ={onEpochEnd}= next to an =EarlyStopping= crashes with
+  =TypeError "callback.setParams is not a function"= [LIVE phase 2]. The wrapper wraps every
+  hook map in =new tf.CustomCallback(...)= (exported from the umbrella) before passing the
+  list. =registerCallbackConstructor(verbosity, ctor)= adds global callbacks per verbosity
+  level.
 - The default =yieldEvery 'auto'= inserts =setTimeout=-based yields every 125 ms
   (=DEFAULT_YIELD_EVERY_MS=) so the event loop stays responsive; ='never'= is fastest for
   batch jobs.
@@ -574,14 +589,14 @@ Facts that shape the design:
 | Namespace                | Phase | Contents (public) |
 |--------------------------+-------+-------------------|
 | =tensorflow-cljs.util=     | 0 ✓   | kebab↔camel, =->config=, =->kebab-keys=, =enum-value=, dtypes, shapes, error constructors / predicates (pure, no interop) |
-| =tensorflow-cljs.binding=  | 2     | THE interop namespace: =(:require ["@tensorflow/tfjs" :as tf])=, tensor construction from CLJS data, =tensor?=, data readers (=data-sync= → vector, =data= → promise), =->js-config= (=clj->js= over =util/->config= output, functions passed through), =->clj-result= (typed arrays → vectors, =NamedTensorMap= → kebab map of tensors, arrays → vectors), op invocation helpers (=(call op & args)=), error wrapping (=try= → =util/tf-error= with =(.-name (.-constructor e))=), promise wrapping (=p/promise= over JS promises), backend / env / memory access, io handler objects (=#js {:save … :load …}=), callback object construction, dataset iterator stepping. No public API for consumers. |
+| =tensorflow-cljs.binding=  | 2     | *Phase 2 decision: folded into =tensorflow-cljs.core=* — the user directive names =core= as the ONE tfjs-interop namespace, so the bridge functions below (=make-layer=, =model-fit!=, =dataset-batch=, the file handler …) live in =core= and =layers= / =models= / =data= call them. Originally planned as THE interop namespace: =(:require ["@tensorflow/tfjs" :as tf])=, tensor construction from CLJS data, =tensor?=, data readers (=data-sync= → vector, =data= → promise), =->js-config= (=clj->js= over =util/->config= output, functions passed through), =->clj-result= (typed arrays → vectors, =NamedTensorMap= → kebab map of tensors, arrays → vectors), op invocation helpers (=(call op & args)=), error wrapping (=try= → =util/tf-error= with =(.-name (.-constructor e))=), promise wrapping (=p/promise= over JS promises), backend / env / memory access, io handler objects (=#js {:save … :load …}=), callback object construction, dataset iterator stepping. No public API for consumers. |
 | =tensorflow-cljs.core=     | 2     | tensors as opaque values: =tensor= =scalar= =zeros= =ones= =fill= =eye= =linspace= =range= =random-normal= =random-uniform= =random-uniform-int= =truncated-normal= =one-hot= =variable= =assign!= =clone=; readers =->vec= =->vec!= =data-sync= =data!= =get= =shape= =dtype= =size= =rank=; memory =tidy= (macro-free: =(tidy (fn [] …))=), =dispose!= =keep= =memory= =profile!= =time!= =dispose-variables!=; backend =backend= =set-backend!= =ready!= =find-backend= =env-flag= =prod-mode!=; =version= |
-| =tensorflow-cljs.ops=      | 2     | the whole op algebra, one CLJS fn per tfjs op, kebab names (=mat-mul= =arg-max= =expand-dims= =log-sum-exp= =conv2d-transpose= …), positional args mirroring tfjs, trailing option map for optional named args where tfjs has >2 optionals (=(ops/conv2d x filter {:strides 1 :pad :same :data-format :nhwc})=); namespaces inside as prefixes: =image-resize-bilinear=, =linalg-qr=, =losses-mean-squared-error=, =sparse-*=, =string-*=, =signal-*=, =fused-*=. Async ops return promises (=where!= =boolean-mask!= =in-top-k!= =setdiff1d!=). Object returns → kebab maps of tensors. |
+| =tensorflow-cljs.ops=      | 2     | *Phase 2: merged into =core=* (one namespace for the tensor core, per directive). The whole op algebra, one CLJS fn per tfjs op, kebab names (=mat-mul= =arg-max= =expand-dims= =log-sum-exp= =conv2d-transpose= …), positional args mirroring tfjs, trailing option map for optional named args where tfjs has >2 optionals (=(ops/conv2d x filter {:strides 1 :pad :same :data-format :nhwc})=); namespaces inside as prefixes: =image-resize-bilinear=, =linalg-qr=, =losses-mean-squared-error=, =sparse-*=, =string-*=, =signal-*=, =fused-*=. Async ops return promises (=where!= =boolean-mask!= =in-top-k!= =setdiff1d!=). Object returns → kebab maps of tensors. |
 | =tensorflow-cljs.layers=   | 3     | 72 constructors =(layers/dense {:units 4 …})=, =(layers/apply layer inputs)=, =get-weights= =set-weights!= =count-params= =config= =output-shape= =layer-name= =class-name= =trainable?=; =input= (symbolic); registries: =initializers/*= =regularizers/*= =constraints/*= as constructor fns for the non-string cases |
 | =tensorflow-cljs.models=   | 3     | =sequential= =model= =add!= =compile!= =fit!= =fit-dataset!= =train-on-batch!= =predict= =predict-on-batch= =evaluate= =evaluate-dataset!= =summary= =layers= =get-layer= =get-weights= =set-weights!= =count-params= =metrics-names= =stop-training!= =dispose!= =to-json= =model-from-json!= =user-metadata= |
-| =tensorflow-cljs.train=    | 3     | optimizers =sgd= =momentum= =adam= =adamax= =adadelta= =adagrad= =rmsprop= (opaque), =minimize!= =compute-gradients= =apply-gradients!= =optimizer-weights!=; =grad= =grads= =value-and-grad= =variable-grads= =custom-grad=; =losses/*= =metrics/*= as fns; =callbacks/early-stopping=; callback map → tfjs callback translation |
+| =tensorflow-cljs.train=    | 3     | *Phase 3: optimizers / gradients / =minimize!= live in =core=; =models/optimizer= gives the kebab option-map form; =callbacks= bridged in =core= / =models=.* Planned contents: optimizers =sgd= =momentum= =adam= =adamax= =adadelta= =adagrad= =rmsprop= (opaque), =minimize!= =compute-gradients= =apply-gradients!= =optimizer-weights!=; =grad= =grads= =value-and-grad= =variable-grads= =custom-grad=; =losses/*= =metrics/*= as fns; =callbacks/early-stopping=; callback map → tfjs callback translation |
 | =tensorflow-cljs.data=     | 4     | =array= =generator= =csv= =zip= =batch= =map= =map!= =filter= =shuffle= =repeat= =take= =skip= =prefetch= =concatenate= =size= =to-vec!= =for-each!= =iterator!= =next!= =chan= =column-names!= |
-| =tensorflow-cljs.io=       | 4     | =save!= =load-model!= with handler values: =memory-handler= (in-process artifacts map), =file-handler= (node fs: =model.json= + =weights.bin= in a directory; accepts ="file://…"= strings), =http-handler= (=tf.io.http=), =custom-handler= ({:save fn :load fn}); =artifacts->clj= / =clj->artifacts=; =load-graph-model!= (read scope) |
+| =tensorflow-cljs.io=       | 4     | *Phase 3 delivered the file / memory / http paths as =models/save!= =models/load!= =models/save-artifacts!= =models/load-artifacts!= (file handler in =core=: =save-artifacts-to-dir!= / =read-artifacts-from-dir!=, single shard on save, manifest-order concat on load — 2-shard test in =load-concatenates-multi-shard-manifests=).* Remaining for phase 4: =load-graph-model!=, custom handler objects. Planned: =save!= =load-model!= with handler values: =memory-handler= (in-process artifacts map), =file-handler= (node fs: =model.json= + =weights.bin= in a directory; accepts ="file://…"= strings), =http-handler= (=tf.io.http=), =custom-handler= ({:save fn :load fn}); =artifacts->clj= / =clj->artifacts=; =load-graph-model!= (read scope) |
 | =tensorflow-cljs.dev= / =smoke= | 5 | end-to-end XOR train → save (file) → reload → predict; perf baseline print |
 
 ** 9.2 Tensors as opaque values (house rule)
@@ -660,20 +675,20 @@ interleaved flat vector and =(ops/real t)= / =(ops/imag t)= are the recommended 
 | 11.1    | tfjs-node as opt-in backend: does =require('@tensorflow/tfjs-node')= from the consumer's project register the =tensorflow= backend into the SAME tfjs-core instance the wrapper holds (npm dedupe of =@tensorflow/tfjs= 4.22.0 → one copy), and does the node 22 napi-v8/v9 directory bug bite on this machine? | Phase 5: optional smoke (=TFJS_NODE=1=) that requires tfjs-node before the wrapper, checks =(tf/backend)= = ="tensorflow"=; not installed by default. Document the copy-napi-v8 workaround from tfjs#8430. |
 | 11.2    | =tf.getBackend()= is =undefined= until initialisation — should =core/backend= force =ready!= first? | =backend= returns =nil= until ready; =ready!= is called by =fit!= / =predict= implicitly by tfjs; the smoke calls =ready!= first. |
 | 11.3    | Large-tensor conversion cost: =->vec= over a 10⁶-element Float32Array through =js->clj= / =vec=. | Measure in phase 2; keep =data-sync= returning a =vec= of the typed array (=(vec (array-seq ta))=) and add =->typed-array= escape hatch ONLY inside the binding namespace tests. |
-| 11.4    | Do CLJS persistent structures survive tfjs's =tidy= container walk without pathological cost (the walk uses =for…in= over ALL enumerable properties including CLJS prototype methods)? Verified only with a hand-made prototype object. | Phase 2 test: return a CLJS map / vector of tensors from =tidy=; if slow, =core/tidy= converts the CLJS return value's tensors to a JS array before ending the scope and rebuilds. |
+| 11.4    | Do CLJS persistent structures survive tfjs's =tidy= container walk without pathological cost (the walk uses =for…in= over ALL enumerable properties including CLJS prototype methods)? Verified only with a hand-made prototype object. | *Resolved (phase 2):* =core/tidy= never lets tfjs walk CLJS data — it collects the tensors of the return value with a CLJS walk (maps, vectors, sets, seqs, JS arrays / objects) and returns a JS array to =tf.tidy=, then hands the original value back; =dispose!= does the same. Measured: a 200-tensor map through =tidy= in well under 250 ms (test asserts the bound; typical run ≈ a few ms). |
 | 11.5    | Banner suppression: =enableProdMode= also disables the tensorlike shape-consistency check (ragged input then silently produces garbage) and NaN checks. | Default: do NOT enable PROD; document the banner; offer =(core/prod-mode!)=. Setting =IS_TEST= instead is rejected (it changes other test-only code paths). |
 | 11.6    | Weight sharding: tfjs-node / converter output splits weights into 4 MB shards (=weightsManifest= with several =paths=); our file handler must concatenate shards in manifest order on load and may write a single shard on save. Quantized manifests (=quantization: {dtype 'uint8'|'uint16'|'float16', min, scale}=) are decoded by =decodeWeights= automatically. | Load: read every path, =concatenateArrayBuffers=, then =getModelArtifactsForJSONSync=. Save: single =weights.bin=. Test with a fabricated 2-shard manifest. |
 | 11.7    | complex64 CLJS representation. | Flat interleaved vector + =real= / =imag= ops; no complex record. Revisit only on demand. |
 | 11.8    | String tensors under the no-interop rule: =dataSync= returns =string[]=; =bytes()= Uint8Array[]; string ops live in =tf.string.*= and need =NamedTensorMap= results. | Supported as opaque tensors with =->vec=; =string-*= ops exposed; no Buffer exposure. |
-| 11.9    | =trainingConfig= round trip: after =load-model!=, is the model compiled? tfjs calls =loadTrainingConfig= when =trainingConfig= is present (source shows it), so =fit!= should work without =compile!=. | Verify in phase 4 smoke; document that =compile!= after load is optional but resets the optimizer state. |
+| 11.9    | =trainingConfig= round trip: after =load-model!=, is the model compiled? tfjs calls =loadTrainingConfig= when =trainingConfig= is present (source shows it), so =fit!= should work without =compile!=. | *Resolved (phase 2):* only when saved with ={:include-optimizer true}= (=models/save!= opts); then the loaded model is compiled (=metricsNames= restored) and =fit!= works without =compile!= (test =save-and-load-round-trip-via-temp-dir=). Default saves need =compile-model!= after =load!=. |
 | 11.10   | =tf.data.map= with CLJS fns: each element crosses JS→CLJS→JS; tensors created inside =map= are owned by the dataset (tfjs disposes batch inputs after =fitDataset= steps). Who disposes tensors created by a CLJS =map= fn when the consumer uses =to-vec!=? | Document: =to-vec!= results are owned by the caller; provide =(data/dispose-all! coll)=. Measure conversion overhead; offer =map-js= (binding-level, no conversion) only if needed. |
 | 11.11   | =fit!= progress under =verbose 1= writes a progress bar with =process.stdout= escape codes — acceptable in a REPL, noisy in logs. | Default =:verbose 0= in the wrapper; callbacks for progress. |
 | 11.12   | GraphModel scope: only =load-graph-model!= + =predict= (read scope) or none? | Include read scope in phase 4 (≈40 lines); no =registerOp=. |
-| 11.13   | Activation identifier spelling exceptions: =gelu_new= (snake) vs =hardSigmoid= (camel) in =ActivationIdentifier=; serialization uses snake for all. | =enum-value= special-cases =:gelu-new= → ="gelu_new"= (add to util in phase 3 with a test). |
+| 11.13   | Activation identifier spelling exceptions: =gelu_new= (snake) vs =hardSigmoid= (camel) in =ActivationIdentifier=; serialization uses snake for all. | *Done (phase 2/3):* =util/enum-exceptions= ={:gelu-new "gelu_new"}=, tested; =layers/activations= registry validates the 15 identifiers before tfjs. |
 | 11.14   | =yieldEvery 'auto'= inserts =setTimeout= yields (125 ms) — good for interactive use, slower for batch. | Wrapper default =:yield-every :auto= (tfjs default) but the smoke uses =:never=; document. |
-| 11.15   | Does =evaluate= / =predict= need =tidy= internally to avoid leaking intermediate tensors? tfjs wraps them; only the returned tensors remain. | Phase 3 leak test around =predict= and =evaluate= (numTensors delta = outputs only). |
+| 11.15   | Does =evaluate= / =predict= need =tidy= internally to avoid leaking intermediate tensors? tfjs wraps them; only the returned tensors remain. | *Resolved (phase 3):* =predict= leaves exactly its output tensor(s); =models/evaluate= reads and disposes the scalars (numTensors delta 0). Tested in =evaluate-returns-metric-map=. |
 | 11.16   | Seeds: =randomNormal(shape, mean, std, dtype, seed)= and =shuffle(buf, seed: string)= determinism on CPU is documented as best-effort; reproducibility across tfjs versions is not guaranteed. | Tests use seeds AND loose tolerances (=test-util/approx==). |
-| 11.17   | =Dataset.size= is =null= after =filter= and =Infinity= after unbounded =repeat= — =fitDataset= then REQUIRES =batchesPerEpoch=. | =fit-dataset!= validates: if =(size ds)= is nil/infinite and no =:batches-per-epoch=, throw =:argument-error= before calling tfjs. |
+| 11.17   | =Dataset.size= is =null= after =filter= and =Infinity= after unbounded =repeat= — =fitDataset= then REQUIRES =batchesPerEpoch=. | *Done (phase 3):* =models/fit-dataset!= rejects with =:argument-error= when =(data/size ds)= is nil / infinite and =:batches-per-epoch= is absent (tested). |
 | 11.18   | Zero-dep rule vs =source-map-support= / promesa: promesa is a Clojars dep (fine); =source-map-support= is dev-only. | As in siblings. |
 
 * 12. Sources

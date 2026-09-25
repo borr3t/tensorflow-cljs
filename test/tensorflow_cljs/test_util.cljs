@@ -1,9 +1,11 @@
 (ns tensorflow-cljs.test-util
   "Shared fixtures for the tensorflow-cljs tests. Not a test namespace itself
-   (the name does not end in -test). Phase 2 adds tensor-equality helpers
-   (approximate float32 comparison) and a memory-leak fixture (tf.memory()
-   numTensors before/after) here so tests stay deterministic and in-process."
-  (:require [promesa.core :as p]))
+   (the name does not end in -test): rejection / thrown capture, approximate
+   float32 comparison, an async-test finisher and a temp-dir helper (the
+   tests may touch node `os` / `fs` / `path`; the library itself confines
+   interop to tensorflow-cljs.core)."
+  (:require [cljs.test :refer [is]]
+            [promesa.core :as p]))
 
 (defn rejection
   "Promise of the rejection reason of `p` (fails the assertion if it resolves)."
@@ -30,3 +32,53 @@
      (and (sequential? a) (sequential? b)) (and (= (count a) (count b))
                                                 (every? true? (map #(approx= %1 %2 eps) a b)))
      :else (= a b))))
+
+(defn finish
+  "Terminates an (async done ..) test: an unexpected rejection of `promise`
+   fails one assertion with the reason, then `done` is called."
+  [promise done]
+  (-> promise
+      (p/catch (fn [e] (is false (str "unexpected rejection: " (ex-message e) " " (pr-str (ex-data e))))))
+      (p/then (fn [_] (done)))))
+
+(def ^:private os (js/require "os"))
+(def ^:private fs (js/require "fs"))
+(def ^:private path (js/require "path"))
+
+(defn temp-dir!
+  "A fresh temporary directory (os.tmpdir + mkdtemp)."
+  [prefix]
+  (.mkdtempSync fs (.join path (.tmpdir os) prefix)))
+
+(defn rm-rf!
+  "Recursively deletes a directory (best effort)."
+  [dir]
+  (.rmSync fs dir #js {:recursive true :force true}))
+
+(defn write-file!
+  "Writes a string to a file."
+  [file content]
+  (.writeFileSync fs file content))
+
+(defn read-file
+  "Reads a file as a string."
+  [file]
+  (.readFileSync fs file "utf8"))
+
+(defn file-exists?
+  "True when the path exists."
+  [file]
+  (.existsSync fs file))
+
+(defn join-path
+  "path.join of the segments."
+  [& segs]
+  (apply (.-join path) segs))
+
+(defn split-binary-file!
+  "Splits a binary file into two files at `byte-offset` (for the 2-shard
+   manifest test)."
+  [file a b byte-offset]
+  (let [buf (.readFileSync fs file)]
+    (.writeFileSync fs a (.subarray buf 0 byte-offset))
+    (.writeFileSync fs b (.subarray buf byte-offset))))

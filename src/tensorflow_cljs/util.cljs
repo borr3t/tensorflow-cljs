@@ -66,14 +66,23 @@
    keys are exact tfjs hook names — see enum-value / callback-hook)."
   #{:metadata :user-defined-metadata :weights :tensors :inputs :outputs :callbacks})
 
+(def enum-exceptions
+  "Registry identifiers that are NOT the camelCase rendering of their kebab
+   keyword (inventory 11.13): the gelu_new activation is the one snake_case
+   activation name tfjs accepts."
+  {:gelu-new "gelu_new"})
+
 (defn enum-value
   "Keyword enum value -> tfjs registry string. Registry names are camelCase
    (:relu -> \"relu\", :glorot-uniform -> \"glorotUniform\", :categorical-crossentropy
    -> \"categoricalCrossentropy\", :channels-last -> \"channelsLast\");
    non-keywords untouched. Padding modes and dtypes are single words and thus
-   unchanged (:same, :valid, :float32)."
+   unchanged (:same, :valid, :float32). enum-exceptions (:gelu-new ->
+   \"gelu_new\") are honoured."
   [v]
-  (if (keyword? v) (kebab->camel v) v))
+  (if (keyword? v)
+    (or (get enum-exceptions v) (kebab->camel v))
+    v))
 
 (declare ->config)
 
@@ -147,13 +156,27 @@
   (reduce * 1 shape))
 
 (defn infer-shape
-  "Shape of a nested vector (\"ragged\" input is not detected here; tfjs
-   validates). Scalars -> []."
+  "Shape of a nested vector, read from the first element at every level
+   (see `ragged?` for the consistency check). Scalars -> []."
   [x]
   (loop [x x acc []]
     (if (sequential? x)
       (recur (first x) (conj acc (count x)))
       acc)))
+
+(defn ragged?
+  "True when nested data does not have the same length at every level of
+   the shape implied by its first elements ([1 [2 3]], [[1 2] [3]],
+   [[1 2] [3 4 5] [6]]). tfjs 4.22 does NOT check this itself
+   (TENSORLIKE_CHECK_SHAPE_CONSISTENCY defaults to false), so the wrapper
+   rejects ragged input before tfjs silently mis-shapes it."
+  ([x] (ragged? x (infer-shape x)))
+  ([x shape]
+   (if (empty? shape)
+     (sequential? x)
+     (or (not (sequential? x))
+         (not= (first shape) (count x))
+         (boolean (some #(ragged? % (rest shape)) x))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Errors
@@ -169,8 +192,8 @@
    (inventory 8): :value-error (tfjs-layers ValueError), :runtime-error,
    :not-implemented-error, :attribute-error, :index-error, :assertion-error
    (tfjs-core util.assert throws plain Error whose message starts with
-   \"Error in <op>\"), :shape-error (message mentions shape/rank/dtype mismatch)
-   or :unknown."
+   \"Error in <op>\"), :shape-error (message mentions shape / rank / dtype /
+   dimension, or a \"must be int32 tensor\"-style dtype demand) or :unknown."
   [name message]
   (let [msg (str message)]
     (cond
@@ -179,7 +202,7 @@
       (= name "NotImplementedError") :not-implemented-error
       (= name "AttributeError") :attribute-error
       (= name "IndexError") :index-error
-      (re-find #"(?i)shape|rank|dtype|dimension" msg) :shape-error
+      (re-find #"(?i)shape|rank|dtype|dimension|must be (an? )?(int32|float32|bool|string|numeric|complex64)" msg) :shape-error
       (re-find #"^Error in " msg) :assertion-error
       :else :unknown)))
 
