@@ -35,4 +35,12 @@
   ;;   npx shadow-cljs compile smoke && node target/smoke.js
   :smoke {:target :node-script
           :main tensorflow-cljs.smoke/main
-          :output-to "target/smoke.js"}}}
+          :output-to "target/smoke.js"}
+
+  ;; The examples of the README (dev/tensorflow_cljs/examples.cljs): tensors,
+  ;; a model trained, saved, loaded and fed from a pipeline, all computed in
+  ;; this process on the CPU backend. No network:
+  ;;   npx shadow-cljs compile examples && node target/examples.js
+  :examples {:target :node-script
+             :main tensorflow-cljs.examples/main
+             :output-to "target/examples.js"}}}

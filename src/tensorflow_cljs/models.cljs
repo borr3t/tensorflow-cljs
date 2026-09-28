@@ -1,5 +1,5 @@
 (ns tensorflow-cljs.models
-  "Models (inventory §4, §6): sequential and functional construction,
+  "Models: sequential and functional construction,
    compile / fit / predict / evaluate, tf.data training, callbacks, save /
    load, weights and summaries. Models are OPAQUE values; configs are
    kebab keyword maps; asynchronous tfjs calls return promesa promises
@@ -15,7 +15,7 @@
             [tensorflow-cljs.util :as util]))
 
 ;; ---------------------------------------------------------------------------
-;; Registries (kebab keyword -> compile-time tfjs identifier), inventory §3.3
+;; Registries (kebab keyword -> compile-time tfjs identifier)
 ;; ---------------------------------------------------------------------------
 
 (def losses
@@ -342,7 +342,7 @@
   "Saves the model to a directory (or a model.json path, or a \"file://\"
    URL) as `model.json` + one `weights.bin` shard — the tfjs-node /
    tensorflowjs_converter layout — with the library's own node-fs handler
-   (pure tfjs has no file:// handler, inventory §4.6). opts
+   (pure tfjs has no file:// handler). opts
    {:include-optimizer false (true stores the training config so `load!`
    yields a compiled model) :trainable-only false}. Promise of {:dir
    :model-json :weights-bin :model-artifacts-info}."
@@ -366,7 +366,7 @@
        (core/load-artifacts! artifacts)))))
 
 ;; ---------------------------------------------------------------------------
-;; Graph models (tfjs-converter output, inventory §4.7): inference only
+;; Graph models (tfjs-converter output): inference only
 ;; ---------------------------------------------------------------------------
 
 (defn load-graph!

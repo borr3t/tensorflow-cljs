@@ -1,5 +1,5 @@
 (ns tensorflow-cljs.layers
-  "Keras-style layer catalog of tfjs-layers (inventory §3): every one of the
+  "Keras-style layer catalog of tfjs-layers: every one of the
    72 layer constructors as a ClojureScript fn taking a kebab config map,
    e.g. (dense {:units 4 :activation :relu :kernel-initializer :glorot-uniform
    :input-shape [2]}) — 66 distinct constructors plus the 10 pooling aliases. Keys become camelCase, keyword values become tfjs
@@ -18,7 +18,7 @@
             [tensorflow-cljs.util :as util]))
 
 ;; ---------------------------------------------------------------------------
-;; Registries (kebab keyword -> tfjs identifier) — data, inventory §3.3
+;; Registries (kebab keyword -> tfjs identifier) — data
 ;; ---------------------------------------------------------------------------
 
 (def activations
@@ -172,7 +172,7 @@
   (fn ([] (layer type nil)) ([config] (layer type config))))
 
 ;; ---------------------------------------------------------------------------
-;; The catalog (one fn per constructor; config keys per inventory §3.1).
+;; The catalog (one fn per constructor).
 ;; Common base keys: :input-shape :batch-input-shape :batch-size :dtype :name
 ;; :trainable :weights (vector of tensors) :input-d-type
 ;; ---------------------------------------------------------------------------

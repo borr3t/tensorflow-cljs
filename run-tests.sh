@@ -12,12 +12,16 @@
 #
 # The tests never touch the network: `npm install` (first run only) fetches the
 # toolchain plus `@tensorflow/tfjs`; tensor tests run on the in-process CPU backend.
+#
+# The publicity gate runs FIRST: src/ and README.md are public documentation.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -d node_modules ]; then
   npm install
 fi
+
+bash test/publicity_gate.sh
 
 npx shadow-cljs compile node-test --config-merge '{:autorun false}'
 exec node target/node-test.js

@@ -1,5 +1,5 @@
 (ns tensorflow-cljs.data
-  "tf.data pipelines under node (inventory §5): sources (`from-vec`,
+  "tf.data pipelines under node: sources (`from-vec`,
    `generator`, `func`, `csv`, `zip`), combinators (`batch` `map` `filter`
    `shuffle` `repeat` `take` `skip` `prefetch` `concatenate`) and consumers
    (`to-vec!` `for-each!` `iterator!` `next!` `->batches!` and the
@@ -9,7 +9,7 @@
    strings and opaque tensors. Every consumer returns a promesa promise
    (tf.data is pull-based, promise per element).
 
-   Ownership (inventory 11.10): tensors inside `to-vec!` results belong to
+   Ownership: tensors inside `to-vec!` results belong to
    the caller — `dispose-all!` frees them.
 
    No JavaScript interop here — everything goes through tensorflow-cljs.core."
@@ -161,7 +161,7 @@
   (core/csv-column-names! ds))
 
 ;; ---------------------------------------------------------------------------
-;; core.async channel (house pattern shared with the leveldb-cljs iterators)
+;; core.async channel
 ;; ---------------------------------------------------------------------------
 
 (def default-channel-buffer

@@ -13,13 +13,13 @@
      compare through `->vec`, identity is the only equality);
    - readers that COPY OUT to ClojureScript data (`->vec` / `->clj`,
      `data-sync`, `get-element`) and their promise forms (`->vec!`, `data!`);
-   - the whole op algebra of tfjs-core (inventory §2.2), one function per
+   - the whole op algebra of tfjs-core, one function per
      tfjs op, kebab names, positional arguments mirroring tfjs, trailing
      option maps where tfjs has many optionals;
    - memory management: `tidy`, `dispose!`, `keep`, `memory`;
    - backend / environment control;
    - optimizers, gradients and `minimize!` (custom training loops);
-   - the layer / model / io / data bridges consumed by the sibling namespaces.
+   - the layer / model / io / data bridges consumed by the other namespaces.
 
    Numbers -> float32: EVERY ClojureScript number becomes an IEEE float32 on
    entry unless `:dtype :int32` is given (0.1 reads back as
@@ -50,7 +50,7 @@
 
 (defn- js-error-name
   "constructor.name of a thrown JS value (the tfjs-layers error classes do
-   not set .name, inventory §8)."
+   not set .name)."
   [e]
   (or (some-> e (gobj/get "constructor") (gobj/get "name")) "Error"))
 
@@ -145,7 +145,7 @@
 (defn- base-callback? [x] (instance? base-callback-class x))
 
 ;; ---------------------------------------------------------------------------
-;; ClojureScript <-> JS value conversion (the DataValues boundary, §2.7)
+;; ClojureScript <-> JS value conversion (the DataValues boundary)
 ;; ---------------------------------------------------------------------------
 
 (defn- key-name
@@ -278,7 +278,7 @@
     :else []))
 
 ;; ---------------------------------------------------------------------------
-;; Creation (§2.1)
+;; Creation
 ;; ---------------------------------------------------------------------------
 
 (defn- creation-opts
@@ -392,7 +392,7 @@
 
 (defn random-normal
   "Normal samples of `shape`; opts {:mean 0 :std-dev 1 :dtype :float32 :seed n}.
-   Seeds make the CPU backend reproducible (best effort, inventory 11.16)."
+   Seeds make the CPU backend reproducible (best effort)."
   ([shape] (random-normal shape nil))
   ([shape {:keys [mean std-dev dtype seed]}]
    (guard #(tf/randomNormal (shape-arg shape) (undef-if-nil mean) (undef-if-nil std-dev)
@@ -458,7 +458,7 @@
 (defn complex
   "complex64 tensor from real and imaginary float32 parts (tensors or
    vectors). Read back with `real` / `imag`; `->vec` yields the interleaved
-   [re im re im ..] flat data (inventory 11.7)."
+   [re im re im ..] flat data."
   [real imag]
   (guard #(tf/complex (->arg real) (->arg imag))))
 
@@ -483,7 +483,7 @@
 (defn clone "Copy of tensor `x` (new memory)." [x] (guard #(tf/clone (->arg x))))
 
 ;; ---------------------------------------------------------------------------
-;; Reading out (§2.3, §2.5): every reader COPIES to ClojureScript data
+;; Reading out: every reader COPIES to ClojureScript data
 ;; ---------------------------------------------------------------------------
 
 (defn shape "Shape vector of a tensor (or symbolic tensor; nil = unknown batch dim)." [t] (js-array->clj (gobj/get t "shape")))
@@ -495,7 +495,7 @@
 
 (defn- read-nested
   "arraySync-style nested JS arrays -> ClojureScript, with the bool 1/0 ->
-   boolean pass (§9.5)."
+   boolean pass."
   [t nested]
   (let [v (js-array->clj nested)]
     (if (= "bool" (gobj/get t "dtype")) (bools v) v)))
@@ -581,18 +581,18 @@
 (defn buffer->tensor "Immutable tensor snapshot of a buffer." [b] (guard #(js-invoke b "toTensor")))
 
 ;; ---------------------------------------------------------------------------
-;; Memory (§2.6)
+;; Memory
 ;; ---------------------------------------------------------------------------
 
 (defn tidy
   "Runs the zero-argument fn `f` in a tfjs scope: every tensor created inside
    is disposed at the end EXCEPT those reachable from the return value, which
    may be a tensor or any ClojureScript / JS container of tensors (map,
-   vector, set, seq, nested). House position for inventory 11.4: the return
-   value's tensors are collected by a ClojureScript walk and handed to tfjs
-   as a JS array before the scope closes, so tfjs never walks persistent
-   structures. `f` must be synchronous (an async fn leaks). Returns `f`'s
-   value. Optional `name` labels the scope for profiling."
+   vector, set, seq, nested). The return value's tensors are collected by a
+   ClojureScript walk and handed to tfjs as a JS array before the scope
+   closes, so tfjs never walks persistent structures. `f` must be
+   synchronous (an async fn leaks). Returns `f`'s value. Optional `name`
+   labels the scope for profiling."
   ([f] (tidy nil f))
   ([name f]
    (when-not (fn? f)
@@ -649,12 +649,12 @@
   (-> (async-guard #(tf/time f)) (p/then js->kebab)))
 
 ;; ---------------------------------------------------------------------------
-;; Backend / environment (§7)
+;; Backend / environment
 ;; ---------------------------------------------------------------------------
 
 (defn backend
   "Name of the active backend (\"cpu\" under node) or nil before
-   initialisation (call `ready!` or run any op first; inventory 11.2)."
+   initialisation (call `ready!` or run any op first)."
   []
   (tf/getBackend))
 
@@ -693,7 +693,7 @@
 
 (defn prod-mode!
   "Enables tfjs production mode: silences the node banner, skips the
-   TensorLike shape-consistency check and NaN checks (inventory 11.5). Not
+   TensorLike shape-consistency check and NaN checks. Not
    called by default."
   []
   (tf/enableProdMode) nil)
@@ -714,7 +714,7 @@
   (into {} (map (fn [[k v]] [(keyword k) v])) (js->clj tf/version)))
 
 ;; ---------------------------------------------------------------------------
-;; The op algebra (§2.2). Helpers build the trivial arities; every op is a
+;; The op algebra. Helpers build the trivial arities; every op is a
 ;; public fn with a docstring. Positional args mirror tfjs; nil optionals
 ;; become undefined so tfjs applies its defaults.
 ;; ---------------------------------------------------------------------------
@@ -1204,7 +1204,7 @@
 (defn static-regex-replace "Replaces `pattern` (a regex string) with `rewrite` in a string tensor; `replace-global` (default true)." ([input pattern rewrite] (call (ns-fn tf/string "staticRegexReplace") input pattern rewrite)) ([input pattern rewrite replace-global] (call (ns-fn tf/string "staticRegexReplace") input pattern rewrite replace-global)))
 
 ;; ---------------------------------------------------------------------------
-;; Training utilities (§6.2): optimizers, gradients, minimize!
+;; Training utilities: optimizers, gradients, minimize!
 ;; ---------------------------------------------------------------------------
 
 (defn make-optimizer
@@ -1223,7 +1223,7 @@
 (defn optimizer-dispose!
   "Frees an optimizer's internal tensors; returns nil. Needed because SGD
    keeps its learning rate and Momentum its momentum as plain (kept) scalars
-   that `dispose-variables!` does not see (probe-verified: sgd 1, momentum 2;
+   that `dispose-variables!` does not see (sgd 1, momentum 2;
    adam / adamax / rmsprop / adagrad / adadelta use variables). tfjs 4.22's
    Momentum.dispose frees only one of its two scalars."
   [o]
@@ -1602,7 +1602,7 @@
     (guard #(->result (js-invoke model "execute" (->js-container x) (to-array names))))))
 
 ;; ---------------------------------------------------------------------------
-;; IO bridge: in-memory artifacts + the library's own file handler (§4.6)
+;; IO bridge: in-memory artifacts + the library's own file handler
 ;; ---------------------------------------------------------------------------
 
 (defn- save-config-js [opts] (->config-js (select-keys (or opts {}) [:trainable-only :include-optimizer])))
@@ -1730,7 +1730,7 @@
   (async-guard #(tf/loadLayersModel url (->config-js (or opts {})))))
 
 ;; ---------------------------------------------------------------------------
-;; Graph models (tfjs-converter, inventory §4.7): inference only
+;; Graph models (tfjs-converter): inference only
 ;; ---------------------------------------------------------------------------
 
 (defn graph-model?

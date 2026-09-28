@@ -7,12 +7,12 @@
    Pure: no I/O and no JavaScript interop. Converting CLJS maps to JS config
    objects, wrapping tensors, and reading `message`/`name` off a thrown JS
    error is interop and therefore lives in the single binding namespace
-   (tensorflow-cljs.binding, Phase 2); this namespace only deals in strings,
+   (tensorflow-cljs.core); this namespace only deals in strings,
    keywords and maps."
   (:require [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
-;; kebab-case <-> camelCase (inventory 9.4: every tfjs config key — layer
+;; kebab-case <-> camelCase (every tfjs config key — layer
 ;; args, ModelFitArgs, CompileArgs, io options — is camelCase)
 ;; ---------------------------------------------------------------------------
 
@@ -68,7 +68,7 @@
 
 (def enum-exceptions
   "Registry identifiers that are NOT the camelCase rendering of their kebab
-   keyword (inventory 11.13): the gelu_new activation is the one snake_case
+   keyword: the gelu_new activation is the one snake_case
    activation name tfjs accepts."
   {:gelu-new "gelu_new"})
 
@@ -121,7 +121,7 @@
   (transform-keys camel->kebab x))
 
 ;; ---------------------------------------------------------------------------
-;; dtypes and shapes (inventory 2.4)
+;; dtypes and shapes
 ;; ---------------------------------------------------------------------------
 
 (def dtypes
@@ -188,8 +188,8 @@
     :tensorflow-cljs/io-error :tensorflow-cljs/backend-error})
 
 (defn classify-tf-error
-  "Kebab keyword for a tfjs error given its constructor `name` and `message`
-   (inventory 8): :value-error (tfjs-layers ValueError), :runtime-error,
+  "Kebab keyword for a tfjs error given its constructor `name` and
+   `message`: :value-error (tfjs-layers ValueError), :runtime-error,
    :not-implemented-error, :attribute-error, :index-error, :assertion-error
    (tfjs-core util.assert throws plain Error whose message starts with
    \"Error in <op>\"), :shape-error (message mentions shape / rank / dtype /
